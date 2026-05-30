@@ -151,7 +151,7 @@ def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixin
     last_log_time = 0.
     while (scard := cast(int, r.scard(queue_name))) < min_mixing_n:
       if log_progress and time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-        logger.info("waiting for %s to reach min_mixing_n=%d (%d ready)", queue_name, min_mixing_n, scard)
+        logger.info("waiting for %s - %d / %d", queue_name, scard, min_mixing_n)
         last_log_time = time.perf_counter()
       time.sleep(0.1)
     if log_progress:
