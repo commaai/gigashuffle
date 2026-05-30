@@ -10,6 +10,7 @@ from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader
 
 
 NUM_BATCHES = 20
+SAMPLE_SLEEP_S = float(os.environ.get('GIGASHUFFLE_SAMPLE_SLEEP_S', '2.0'))
 logger = logging.getLogger('gigashuffle.example')
 
 
@@ -20,15 +21,17 @@ class WorkerInfoDataset(IterableDataset):
     image_shape: tuple[int, int, int] = (3, 32, 32),
     num_classes: int = 10,
     device: str = 'cpu',
+    sample_sleep_s: float = SAMPLE_SLEEP_S,
   ) -> None:
     self.chunk_size = chunk_size
     self.image_shape = image_shape
     self.num_classes = num_classes
     self.device = device
+    self.sample_sleep_s = sample_sleep_s
 
   def __iter__(self):
     while True:
-      time.sleep(1)
+      time.sleep(self.sample_sleep_s)
       worker_info = get_worker_info()
       worker_id = -1 if worker_info is None else worker_info.id
       num_workers = 1 if worker_info is None else worker_info.num_workers
@@ -88,27 +91,32 @@ def main() -> None:
     ),
   )
 
+  logger.info("dataset sleeps %.1fs per produced sample; real batches wait for min_mixing, dummy batches do not", SAMPLE_SLEEP_S)
+  dummy_t0 = time.perf_counter()
   dummy_batch = train_loader.get_dummy_batch()
-  logger.info("dummy train batch: images %s labels %s", tuple(dummy_batch[0]['images'].shape), tuple(dummy_batch[0]['labels'].shape))
+  logger.info("dummy train batch returned in %.3fs: images %s labels %s", time.perf_counter() - dummy_t0, tuple(dummy_batch[0]['images'].shape), tuple(dummy_batch[0]['labels'].shape))
 
   try:
     for name, loader, n_batches in [('train', train_loader, NUM_BATCHES), ('val', val_loader, 5)]:
+      batch_t0 = time.perf_counter()
       for i, batch in zip(range(n_batches), loader):
         images = batch[0]['images']
         labels = batch[0]['labels']
         worker_ids = sorted(batch[0]['worker_id'].unique().tolist())
         num_workers = sorted(batch[0]['num_workers'].unique().tolist())
         logger.info(
-          "%s rank %d local_rank %d batch %d: images %s labels %s worker_ids %s num_workers %s",
+          "%s rank %d local_rank %d batch %d after %.3fs: images %s labels %s worker_ids %s num_workers %s",
           name,
           global_rank,
           local_rank,
           i,
+          time.perf_counter() - batch_t0,
           tuple(images.shape),
           tuple(labels.shape),
           worker_ids,
           num_workers,
         )
+        batch_t0 = time.perf_counter()
 
     dist.barrier()
   finally:

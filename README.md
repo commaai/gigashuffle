@@ -28,7 +28,7 @@ redis-server
 torchrun --standalone --nnodes=1 --nproc-per-node=2 examples/basic_usage.py
 ```
 
-Set `USE_GPU_DATASET=1` to make the toy dataset create samples on the local CUDA device before gigashuffle copies them into the CPU shared buffer.
+The example intentionally sleeps while producing samples so `get_dummy_batch()` returns before the shuffle buffer reaches `min_mixing`. Set `GIGASHUFFLE_SAMPLE_SLEEP_S=0` to make it fast again.
 
 ## Usage
 
