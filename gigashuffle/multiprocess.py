@@ -7,18 +7,16 @@ import random
 import re
 import sys
 import time
+import torch
+import numpy as np
+import torch.multiprocessing as mp
 from itertools import batched, count
 from multiprocessing.synchronize import Event
 from multiprocessing.queues import SimpleQueue
 from typing import Any, Iterator, cast
-
-import numpy as np
-import torch
-import torch.multiprocessing as mp
 from redis import StrictRedis
 from setproctitle import setproctitle
 from torch.utils.data import Dataset, IterableDataset
-
 from gigashuffle.worker_info import set_worker_info
 from gigashuffle.config import DataloaderConfig
 
