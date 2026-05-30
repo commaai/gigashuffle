@@ -10,7 +10,7 @@ import torch
 from redis import StrictRedis
 from torch.utils.data import IterableDataset, get_worker_info
 
-from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader
+from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader, ShuffleBufferStats
 from gigashuffle.multiprocess import BatchSizeMismatch, FILL_ONCE_WRITER_DONE_EXITCODE, attach_named_shuffle_buffer, fetch_initial_sample, get_samples, initialize_redis_queue
 
 
@@ -83,6 +83,20 @@ def test_dummy_batch_returns_before_min_mixing(tmp_path):
     batch = loader.get_dummy_batch()
     assert int(r.scard(f'{queue_name}-full')) < 32
     assert batch[0]['worker_id'].eq(0).all()
+  finally:
+    loader.close()
+
+
+def test_stats_report_buffer_counts(tmp_path):
+  r = StrictRedis(**REDIS)
+  queue_name = f'stats-{uuid.uuid4().hex}'
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, tmp_path, shuffle_size=64, min_mixing=0.5))
+  try:
+    stats = loader.stats()
+    assert isinstance(stats, ShuffleBufferStats)
+    assert stats.full == int(r.scard(f'{queue_name}-full'))
+    assert stats.empty == int(r.scard(f'{queue_name}-empty'))
+    assert stats.in_flight == 64 - stats.full - stats.empty
   finally:
     loader.close()
 

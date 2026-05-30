@@ -7,13 +7,15 @@ import random
 import re
 import sys
 import time
-import torch
-import numpy as np
-import torch.multiprocessing as mp
+from dataclasses import dataclass
 from itertools import batched, count
 from multiprocessing.synchronize import Event
 from multiprocessing.queues import SimpleQueue
 from typing import Any, Iterator, cast
+
+import torch
+import numpy as np
+import torch.multiprocessing as mp
 from redis import StrictRedis
 from setproctitle import setproctitle
 from torch.utils.data import Dataset, IterableDataset
@@ -37,6 +39,13 @@ torch.set_num_threads(1)
 
 class BatchSizeMismatch(Exception):
   pass
+
+
+@dataclass(frozen=True, slots=True)
+class ShuffleBufferStats:
+  full: int
+  empty: int
+  in_flight: int
 
 
 def init_logger() -> None:
@@ -359,9 +368,9 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self._rank_id = f'global_rank_{config.global_rank}'
     self._closed = False
 
-    r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+    self._r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
     try:
-      assert r.ping()
+      assert self._r.ping()
     except Exception as e:
       raise AssertionError(f"Redis is not reachable at {config.redis_host}:{config.redis_port}/{config.redis_db}") from e
 
@@ -381,7 +390,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     for i, p in enumerate(self.children):
       p.start()
     self.check_children()
-    self.shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(r, self.queue_name)
+    self.shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(self._r, self.queue_name)
 
   def state_dict(self) -> dict[str, Any]:
     state = {}
@@ -404,6 +413,15 @@ class MultiprocessShuffledDataloader(IterableDataset):
     bs = self.config.bs if bs is None else bs
     shuffle_buffer = attach_named_shuffle_buffer(self.shuffle_buffer_metadata)
     return get_batch_from_input_samples(shuffle_buffer, self.shuffle_buffer_metadata['input_bs'], bs)
+
+  def stats(self) -> ShuffleBufferStats:
+    with self._r.pipeline(transaction=True) as pipe:
+      full, empty = cast(
+        list[int],
+        pipe.scard(f'{self.queue_name}-full').scard(f'{self.queue_name}-empty').execute(),
+      )
+    in_flight = self.config.shuffle_size - full - empty
+    return ShuffleBufferStats(full=full, empty=empty, in_flight=in_flight)
 
   def check_children(self) -> None:
     for i, p in enumerate(self.children):
@@ -428,8 +446,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
           os.unlink(t['path'])
         except FileNotFoundError:
           pass
-      r = StrictRedis(host=self.config.redis_host, port=self.config.redis_port, db=self.config.redis_db)
-      r.delete(f'{self.queue_name}-shared-buffer-meta')
+      self._r.delete(f'{self.queue_name}-shared-buffer-meta')
 
   def __iter__(self) -> Iterator[Buffer]:
     yielded = 0
