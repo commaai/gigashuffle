@@ -11,7 +11,7 @@ from redis import StrictRedis
 from torch.utils.data import IterableDataset, get_worker_info
 
 from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader
-from gigashuffle.multiprocess import BatchSizeMismatch, fetch_initial_sample, get_samples, initialize_redis_queue
+from gigashuffle.multiprocess import BatchSizeMismatch, FILL_ONCE_WRITER_DONE_EXITCODE, attach_named_shuffle_buffer, fetch_initial_sample, get_samples, initialize_redis_queue
 
 
 REDIS = dict(host=os.environ.get('REDIS_HOST', 'localhost'), port=int(os.environ.get('REDIS_PORT', '6379')), db=int(os.environ.get('REDIS_DB', '6')))
@@ -51,8 +51,17 @@ class VariableBatchDataset(IterableDataset):
       i += 1
 
 
+class OrderedDataset(IterableDataset):
+  def __iter__(self):
+    i = 0
+    while True:
+      start = i * 4
+      yield [{'x': torch.arange(start, start + 4)}]
+      i += 1
+
+
 def config(queue_name: str, shm_dir: Path, **kwargs) -> DataloaderConfig:
-  opts = dict(bs=4, shuffle_size=32, min_mixing=0.0, num_writers=1, num_readers=1, redis_host=REDIS['host'], redis_port=REDIS['port'], redis_db=REDIS['db'], shm_dir=str(shm_dir), queue_name=queue_name)
+  opts = dict(bs=4, shuffle_size=32, min_mixing=0.0, num_writers=2, num_readers=2, redis_host=REDIS['host'], redis_port=REDIS['port'], redis_db=REDIS['db'], shm_dir=str(shm_dir), queue_name=queue_name)
   opts.update(kwargs)
   return DataloaderConfig(**opts)
 
@@ -107,6 +116,43 @@ def test_different_input_batch_sizes(tmp_path):
   try:
     batch = next(iter(loader))
     assert batch[0]['x'].shape == batch[0]['y'].shape == (4,)
+  finally:
+    loader.close()
+
+
+def test_fill_once_loops_in_order(tmp_path):
+  r = StrictRedis(**REDIS)
+  queue_name = f'fill-once-{uuid.uuid4().hex}'
+  loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, tmp_path, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1))
+  try:
+    deadline = time.perf_counter() + 5
+    while time.perf_counter() < deadline and int(r.scard(f'{queue_name}-full')) < 12:
+      time.sleep(0.05)
+    assert int(r.scard(f'{queue_name}-full')) == 12
+    shuffle_buffer = attach_named_shuffle_buffer(loader.shuffle_buffer_metadata)
+    expected = [shuffle_buffer[0]['x'][0:4].tolist(), shuffle_buffer[0]['x'][4:8].tolist(), shuffle_buffer[0]['x'][8:12].tolist()]
+    it = iter(loader)
+    assert [next(it)[0]['x'].tolist() for _ in range(3)] == expected
+    with pytest.raises(StopIteration):
+      next(it)
+    assert int(r.scard(f'{queue_name}-empty')) == 0
+    writer = loader.children[1]
+    deadline = time.perf_counter() + 5
+    while time.perf_counter() < deadline and writer.exitcode is None:
+      writer.join(timeout=0.05)
+    assert writer.exitcode == FILL_ONCE_WRITER_DONE_EXITCODE
+    loader.check_children()
+  finally:
+    loader.close()
+
+
+def test_fill_once_iters_repeat(tmp_path):
+  queue_name = f'fill-once-repeat-{uuid.uuid4().hex}'
+  loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, tmp_path, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1))
+  try:
+    first = [batch[0]['x'].tolist() for batch in loader]
+    second = [batch[0]['x'].tolist() for batch in loader]
+    assert first == second
   finally:
     loader.close()
 

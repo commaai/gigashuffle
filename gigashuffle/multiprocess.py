@@ -24,6 +24,7 @@ from gigashuffle.config import DataloaderConfig
 Buffer = list[dict[str, torch.Tensor]]
 CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
+FILL_ONCE_WRITER_DONE_EXITCODE = 81
 ShuffleBufferMetadata = dict[str, Any]
 logger = logging.getLogger(__name__)
 already_warned = False
@@ -128,7 +129,7 @@ def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, i
   if shuffle_size < config.bs * config.local_world_size:
     N = config.local_world_size * config.num_readers
     raise RuntimeError(f"Shuffle buffer must be large enough to accommodate at least N batches, but buffer size = {shuffle_size}, batch size = {config.bs}, N = {N}")
-  if min_mixing_n >= shuffle_size - 2*input_bs:
+  if not config.fill_once and min_mixing_n >= shuffle_size - 2*input_bs:
     raise RuntimeError(f"To avoid deadlock, min_mixing_n ({min_mixing_n}) must be less than {shuffle_size - 2*input_bs}")
 
   return input_samples, input_bs, input_bs_key
@@ -211,7 +212,7 @@ def wait_for_shuffle_buffer_metadata(r: StrictRedis, queue_name: str) -> Shuffle
     time.sleep(0.1)
 
 
-def writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> None:
+def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Any, Buffer, ShuffleBufferMetadata]:
   init_logger()
   setproctitle('gigashuffle writer %d %d' % (config.local_rank, proc_idx))
   os.system('renice -n 3 -p %d > /dev/null' % os.getpid())
@@ -245,43 +246,101 @@ def writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: s
     shuffle_buffer = attach_named_shuffle_buffer(shuffle_buffer_metadata)
 
   logger.info("writer %d-%d initialized with input_bs %d output_bs %d", config.global_rank, proc_idx, shuffle_buffer_metadata['input_bs'], config.bs)
+  return r, dset_iter, shuffle_buffer, shuffle_buffer_metadata
+
+
+def write_samples_to_buffer(shuffle_buffer: Buffer, samples: Buffer, idx_list: list[int], local_input_bs: int) -> None:
+  for i in range(len(shuffle_buffer)):
+    for k in shuffle_buffer[i].keys():
+      tmp = torch.as_tensor(samples[i][k])[:local_input_bs]
+      if tmp.device != shuffle_buffer[i][k].device or tmp.dtype != shuffle_buffer[i][k].dtype:
+        tmp = tmp.to(device=shuffle_buffer[i][k].device, dtype=shuffle_buffer[i][k].dtype)
+      shuffle_buffer[i][k][idx_list] = tmp
+
+
+def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> None:
+  r, dset_iter, shuffle_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  empty_key = f'{queue_name}-empty'
   while True:
     samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'], max_retries=config.writer_max_retries)
-    max_input_bs = (shuffle_size - config.bs) // (config.local_world_size * config.num_writers)
+    max_input_bs = (config.shuffle_size - config.bs) // (config.local_world_size * config.num_writers)
     if local_input_bs > max_input_bs:
       local_input_bs = max_input_bs
       print_small_shuffle_warning()
-
-    idx_list = fetch_rand_from_queue(r, f'{queue_name}-empty', local_input_bs)
-    for i in range(len(shuffle_buffer)):
-      for k in shuffle_buffer[i].keys():
-        tmp = torch.as_tensor(samples[i][k])[:local_input_bs]
-        if tmp.device != shuffle_buffer[i][k].device or tmp.dtype != shuffle_buffer[i][k].dtype:
-          tmp = tmp.to(device=shuffle_buffer[i][k].device, dtype=shuffle_buffer[i][k].dtype)
-        shuffle_buffer[i][k][idx_list] = tmp
+    idx_list = fetch_rand_from_queue(r, empty_key, local_input_bs)
+    write_samples_to_buffer(shuffle_buffer, samples, idx_list, local_input_bs)
     r.sadd(f'{queue_name}-full', *idx_list)
 
 
-def reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, proc_idx: int, queue_name: str):
+def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> None:
+  r, dset_iter, shuffle_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  empty_key = f'{queue_name}-empty'
+  while True:
+    empty_n = cast(int, r.scard(empty_key))
+    if empty_n == 0:
+      raise SystemExit(FILL_ONCE_WRITER_DONE_EXITCODE)
+    samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'], max_retries=config.writer_max_retries)
+    local_input_bs = min(local_input_bs, empty_n)
+    idx_list = [int(x) for x in cast(list[bytes], r.spop(empty_key, local_input_bs))]
+    if not idx_list:
+      raise SystemExit(FILL_ONCE_WRITER_DONE_EXITCODE)
+    local_input_bs = len(idx_list)
+    write_samples_to_buffer(shuffle_buffer, samples, idx_list, local_input_bs)
+    r.sadd(f'{queue_name}-full', *idx_list)
+
+
+def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Buffer, Buffer]:
   init_logger()
   setproctitle('gigashuffle reader %d %d' % (config.local_rank, proc_idx))
   r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
-  min_mixing_n = int(config.min_mixing * config.shuffle_size)
   shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(r, queue_name)
   shuffle_buffer = attach_named_shuffle_buffer(shuffle_buffer_metadata)
   reader_buffer = attach_named_shuffle_buffer(shuffle_buffer_metadata, bs=config.bs, shared=True)
+  return r, shuffle_buffer, reader_buffer
+
+
+def copy_to_reader_buffer(reader_buffer: Buffer, shuffle_buffer: Buffer, idx_list: list[int]) -> None:
+  for buffer_idx in range(len(shuffle_buffer)):
+    for k in shuffle_buffer[buffer_idx].keys():
+      reader_buffer[buffer_idx][k][:] = shuffle_buffer[buffer_idx][k][idx_list]
+
+
+def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, reader_buffer: Buffer, proc_idx: int) -> None:
+  ready_q.put((reader_buffer, proc_idx))
+  while not ready_e.is_set():
+    ready_e.wait()
+  ready_e.clear()
+
+
+def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, proc_idx: int, queue_name: str):
+  r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
+  min_mixing_n = int(config.min_mixing * config.shuffle_size)
 
   for batch_idx in count():
     idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
-    for buffer_idx in range(len(shuffle_buffer)):
-      for k in shuffle_buffer[buffer_idx].keys():
-        reader_buffer[buffer_idx][k][:] = shuffle_buffer[buffer_idx][k][idx_list]
+    copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
     r.sadd(f'{queue_name}-empty', *idx_list)
+    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
-    ready_q.put((reader_buffer, proc_idx))
-    while not ready_e.is_set():
-      ready_e.wait()
-    ready_e.clear()
+
+def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, proc_idx: int, queue_name: str):
+  r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
+
+  last_log_time = 0.
+  full_key = f'{queue_name}-full'
+  while (scard := cast(int, r.scard(full_key))) < config.shuffle_size:
+    if config.local_rank == 0 and time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
+      logger.info("waiting for %s - %d / %d", full_key, scard, config.shuffle_size)
+      last_log_time = time.perf_counter()
+    time.sleep(0.1)
+  if config.local_rank == 0:
+    logger.info("%s reached min_mixing_n=%d", full_key, config.shuffle_size)
+
+  for batch_idx in count():
+    start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs % config.shuffle_size
+    idx_list = list(range(start_idx, start_idx + config.bs))
+    copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
+    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
 class MultiprocessShuffledDataloader(IterableDataset):
@@ -291,6 +350,11 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self.config = config
     assert config.num_writers > 0, "gigashuffle requires num_writers > 0"
     assert config.queue_name, "MultiprocessShuffledDataloader requires config.queue_name"
+    if config.fill_once:
+      assert config.num_readers == 1, "fill_once requires num_readers == 1"
+      assert config.min_mixing == 1, "fill_once requires min_mixing == 1"
+      assert config.shuffle_size % (config.bs * config.local_world_size) == 0, "fill_once requires shuffle_size to be divisible by bs * local_world_size"
+    self.max_iters = config.shuffle_size // (config.bs * config.local_world_size) if config.fill_once else None
     self.queue_name = config.queue_name
     self._rank_id = f'global_rank_{config.global_rank}'
     self._closed = False
@@ -307,10 +371,12 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self.children = []
     self.check_child_time = 0.
 
+    reader_fn = fill_once_reader if config.fill_once else streaming_reader
+    writer_fn = fill_once_writer if config.fill_once else streaming_writer
     for i in range(self.config.num_readers):
-      self.children.append(ctx.Process(target=reader, args=(config, self.ready_q, self.ready_e[i], i, self.queue_name), daemon=True))
+      self.children.append(ctx.Process(target=reader_fn, args=(config, self.ready_q, self.ready_e[i], i, self.queue_name), daemon=True))
     for i in range(self.config.num_writers):
-      self.children.append(ctx.Process(target=writer, args=(dset, config, i, self.queue_name), daemon=True))
+      self.children.append(ctx.Process(target=writer_fn, args=(dset, config, i, self.queue_name), daemon=True))
 
     for i, p in enumerate(self.children):
       p.start()
@@ -340,8 +406,10 @@ class MultiprocessShuffledDataloader(IterableDataset):
     return get_batch_from_input_samples(shuffle_buffer, self.shuffle_buffer_metadata['input_bs'], bs)
 
   def check_children(self) -> None:
-    for p in self.children:
+    for i, p in enumerate(self.children):
       if not p.is_alive():
+        if self.config.fill_once and i >= self.config.num_readers and p.exitcode == FILL_ONCE_WRITER_DONE_EXITCODE:
+          continue
         raise RuntimeError(f"MultiprocessShuffledDataloader child {p.name} (pid={p.pid}) died (exitcode={p.exitcode}). Aborting.")
     self.check_child_time = time.perf_counter()
 
@@ -364,11 +432,15 @@ class MultiprocessShuffledDataloader(IterableDataset):
       r.delete(f'{self.queue_name}-shared-buffer-meta')
 
   def __iter__(self) -> Iterator[Buffer]:
+    yielded = 0
     while True:
       if not self.ready_q.empty():
         buf, idx = self.ready_q.get()
         yield buf
         self.ready_e[idx].set()
+        yielded += 1
+        if self.max_iters is not None and yielded >= self.max_iters:
+          return
       else:
         time.sleep(0.001)
 
