@@ -60,6 +60,16 @@ class OrderedDataset(IterableDataset):
       i += 1
 
 
+class SlowFirstSampleDataset(IterableDataset):
+  def __init__(self, sleep: float) -> None:
+    self.sleep = sleep
+
+  def __iter__(self):
+    time.sleep(self.sleep)
+    while True:
+      yield [{'x': torch.arange(4)}]
+
+
 def config(queue_name: str, shm_dir: Path, **kwargs) -> DataloaderConfig:
   opts = dict(bs=4, shuffle_size=32, min_mixing=0.0, num_writers=2, num_readers=2, redis_host=REDIS['host'], redis_port=REDIS['port'], redis_db=REDIS['db'], shm_dir=str(shm_dir), queue_name=queue_name)
   opts.update(kwargs)
@@ -97,6 +107,16 @@ def test_stats_report_buffer_counts(tmp_path):
     assert stats.full == int(r.scard(f'gigashuffle-{queue_name}-full'))
     assert stats.empty == int(r.scard(f'gigashuffle-{queue_name}-empty'))
     assert stats.in_flight == 64 - stats.full - stats.empty
+  finally:
+    loader.close()
+
+
+def test_init_does_not_wait_for_metadata(tmp_path):
+  queue_name = f'lazy-init-{uuid.uuid4().hex}'
+  start = time.perf_counter()
+  loader = MultiprocessShuffledDataloader(SlowFirstSampleDataset(sleep=5.0), config(queue_name, tmp_path, num_writers=1, num_readers=0))
+  try:
+    assert time.perf_counter() - start < 2.0
   finally:
     loader.close()
 

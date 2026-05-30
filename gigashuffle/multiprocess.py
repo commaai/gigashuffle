@@ -27,6 +27,7 @@ Buffer = list[dict[str, torch.Tensor]]
 CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
 FILL_ONCE_WRITER_DONE_EXITCODE = 81
+CLOSE_JOIN_TIMEOUT_S = 0.2
 ShuffleBufferMetadata = dict[str, Any]
 logger = logging.getLogger(__name__)
 already_warned = False
@@ -365,6 +366,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
       assert config.shuffle_size % (config.bs * config.local_world_size) == 0, "fill_once requires shuffle_size to be divisible by bs * local_world_size"
     self.max_iters = config.shuffle_size // (config.bs * config.local_world_size) if config.fill_once else None
     self.queue_name = f'gigashuffle-{config.queue_name}'
+    self._shuffle_buffer_metadata: ShuffleBufferMetadata | None = None
     self._rank_id = f'global_rank_{config.global_rank}'
     self._closed = False
 
@@ -389,8 +391,12 @@ class MultiprocessShuffledDataloader(IterableDataset):
 
     for i, p in enumerate(self.children):
       p.start()
-    self.check_children()
-    self.shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(self._r, self.queue_name)
+
+  @property
+  def shuffle_buffer_metadata(self) -> ShuffleBufferMetadata:
+    if self._shuffle_buffer_metadata is None:
+      self._shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(self._r, self.queue_name)
+    return self._shuffle_buffer_metadata
 
   def state_dict(self) -> dict[str, Any]:
     state = {}
@@ -438,14 +444,20 @@ class MultiprocessShuffledDataloader(IterableDataset):
     for p in self.children:
       if p.is_alive():
         p.terminate()
+    join_deadline = time.perf_counter() + CLOSE_JOIN_TIMEOUT_S
     for p in self.children:
-      p.join(timeout=5)
+      p.join(timeout=max(0, join_deadline - time.perf_counter()))
+    for p in self.children:
+      if p.is_alive():
+        p.kill()
+        p.join(timeout=0)
     if unlink_shared_memory and self.config.local_rank == 0:
-      for t in self.shuffle_buffer_metadata['fields']:
-        try:
-          os.unlink(t['path'])
-        except FileNotFoundError:
-          pass
+      if self._shuffle_buffer_metadata is not None:
+        for t in self._shuffle_buffer_metadata['fields']:
+          try:
+            os.unlink(t['path'])
+          except FileNotFoundError:
+            pass
       self._r.delete(f'{self.queue_name}-shared-buffer-meta')
 
   def __iter__(self) -> Iterator[Buffer]:
