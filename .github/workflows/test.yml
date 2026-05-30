@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.12
+      - run: uv venv --python 3.12
+      - run: uv pip install --torch-backend cpu -e . --group dev
+      - run: uv run pytest
+        env:
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          REDIS_DB: 6
