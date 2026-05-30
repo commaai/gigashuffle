@@ -24,7 +24,6 @@ from gigashuffle.config import DataloaderConfig
 Buffer = list[dict[str, torch.Tensor]]
 CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
-DATA_MISSING_LIMIT = 100
 ShuffleBufferMetadata = dict[str, Any]
 logger = logging.getLogger(__name__)
 already_warned = False
@@ -90,8 +89,8 @@ def assert_bs_equal(samples, input_bs=None):
         raise BatchSizeMismatch("batch size mismatch in samples")
 
 
-def get_samples(dset, input_bs_key=None):
-  for i in range(DATA_MISSING_LIMIT):
+def get_samples(dset, input_bs_key=None, max_retries=100):
+  for i in range(max_retries):
     samples = next(dset) if hasattr(dset, '__next__') else random.choice(dset)
     if input_bs_key is None:
       input_bs_key = get_input_bs_key(samples)
@@ -99,7 +98,7 @@ def get_samples(dset, input_bs_key=None):
     if input_bs > 0:
       assert_bs_equal(samples, input_bs)
       return samples, input_bs, input_bs_key
-  raise ValueError(f"dataset returned only empty samples in {DATA_MISSING_LIMIT} attempts")
+  raise ValueError(f"dataset returned only empty samples in {max_retries} attempts")
 
 
 def get_memory_size(first_samples, input_bs):
@@ -122,7 +121,7 @@ def get_batch_from_input_samples(input_samples, input_bs, bs):
 def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, int, tuple[int, str]]:
   shuffle_size = config.shuffle_size
   min_mixing_n = int(config.min_mixing * shuffle_size)
-  input_samples, input_bs, input_bs_key = get_samples(dset)
+  input_samples, input_bs, input_bs_key = get_samples(dset, max_retries=config.writer_max_retries)
   memory_size = get_memory_size(input_samples, input_bs)
 
   logger.info("each element uses %d bytes, total buffer size is %.3fgb", memory_size, shuffle_size*memory_size/1e9)
@@ -137,6 +136,7 @@ def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, i
 
 def initialize_redis_queue(r: StrictRedis, queue_name: str, shuffle_size: int) -> None:
   logger.info("setting up %s on redis version %s", queue_name, r.execute_command('INFO')['redis_version'])
+  r.delete(f"{queue_name}-shared-buffer-meta")
   r.delete(f"{queue_name}-empty")
   r.delete(f"{queue_name}-full")
   for idxs in batched(range(0, shuffle_size), n=CHUNK_SIZE):
@@ -227,7 +227,6 @@ def writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: s
   r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
   dset_iter = iter(dset) if hasattr(dset, '__iter__') else dset
   if local_proc_idx == 0:
-    r.delete(f'{queue_name}-shared-buffer-meta')
     initialize_redis_queue(r, queue_name, shuffle_size)
     input_samples, input_bs, input_bs_key = fetch_initial_sample(dset_iter, config)
     shuffle_buffer, shuffle_buffer_metadata = create_named_shuffle_buffer(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.shm_dir)
@@ -247,7 +246,7 @@ def writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: s
 
   logger.info("writer %d-%d initialized with input_bs %d output_bs %d", config.global_rank, proc_idx, shuffle_buffer_metadata['input_bs'], config.bs)
   while True:
-    samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'])
+    samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'], max_retries=config.writer_max_retries)
     max_input_bs = (shuffle_size - config.bs) // (config.local_world_size * config.num_writers)
     if local_input_bs > max_input_bs:
       local_input_bs = max_input_bs

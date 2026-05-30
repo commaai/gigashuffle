@@ -17,3 +17,8 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["gigashuffle", "gigashuffle.*"]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0.3",
+]

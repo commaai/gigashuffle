@@ -2,8 +2,6 @@
 
 Shuffle-buffer dataloading for PyTorch training.
 
-Gigashuffle continuously streams samples through a large named shared-memory buffer and returns random batches from that buffer. It is built for `torchrun`: sibling ranks on a node coordinate through Redis, local rank 0 creates the `/dev/shm` tensors, and the other local ranks attach to that buffer.
-
 ## Install
 
 ```bash
