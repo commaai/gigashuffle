@@ -116,6 +116,11 @@ def get_memory_size(first_samples, input_bs):
   return memory_size // input_bs
 
 
+def get_batch_from_input_samples(input_samples, input_bs, bs):
+  idxs = (np.arange(bs) % input_bs).tolist()
+  return [{k:torch.as_tensor(v[idxs]) for k,v in input_samples[i].items()} for i in range(len(input_samples))]
+
+
 def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, int, tuple[int, str]]:
   shuffle_size = config.shuffle_size
   min_mixing_n = int(config.min_mixing * shuffle_size)
@@ -228,6 +233,14 @@ def writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: s
     initialize_redis_queue(r, queue_name, shuffle_size)
     input_samples, input_bs, input_bs_key = fetch_initial_sample(dset_iter, config)
     shuffle_buffer, shuffle_buffer_metadata = create_named_shuffle_buffer(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.shm_dir)
+    dummy_buffer, dummy_metadata = create_named_shuffle_buffer(input_samples, input_bs, input_bs, input_bs_key, f'{queue_name}-dummy-batch', config.shm_dir, print_shapes=False)
+    for i in range(len(dummy_buffer)):
+      for k in dummy_buffer[i].keys():
+        tmp = torch.as_tensor(input_samples[i][k])
+        if tmp.device != dummy_buffer[i][k].device or tmp.dtype != dummy_buffer[i][k].dtype:
+          tmp = tmp.to(device=dummy_buffer[i][k].device, dtype=dummy_buffer[i][k].dtype)
+        dummy_buffer[i][k][:] = tmp
+    shuffle_buffer_metadata['dummy_batch_fields'] = dummy_metadata['fields']
     r.set(f'{queue_name}-shared-buffer-meta', pickle.dumps(shuffle_buffer_metadata))
   else:
     shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(r, queue_name)
@@ -282,7 +295,6 @@ class MultiprocessShuffledDataloader(IterableDataset):
     assert config.queue_name, "MultiprocessShuffledDataloader requires config.queue_name"
     self.queue_name = config.queue_name
     self._rank_id = f'global_rank_{config.global_rank}'
-    self.dummy_batch: Buffer | None = None
     self._closed = False
 
     r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
@@ -324,10 +336,10 @@ class MultiprocessShuffledDataloader(IterableDataset):
     if 'dataset' in state and hasattr(self.dset, 'load_state_dict'):
       self.dset.load_state_dict(state['dataset'])
 
-  def get_dummy_batch(self, bs: int) -> Buffer:
-    if self.dummy_batch is None:
-      self.dummy_batch = attach_named_shuffle_buffer(self.shuffle_buffer_metadata, bs=bs)
-    return self.dummy_batch
+  def get_dummy_batch(self, bs: int | None = None) -> Buffer:
+    bs = self.config.bs if bs is None else bs
+    input_samples = attach_named_shuffle_buffer(dict(fields=self.shuffle_buffer_metadata['dummy_batch_fields']))
+    return get_batch_from_input_samples(input_samples, self.shuffle_buffer_metadata['input_bs'], bs)
 
   def check_children(self) -> None:
     for p in self.children:
@@ -345,7 +357,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     for p in self.children:
       p.join(timeout=5)
     if unlink_shared_memory and self.config.local_rank == 0:
-      for t in self.shuffle_buffer_metadata['fields']:
+      for t in self.shuffle_buffer_metadata['fields'] + self.shuffle_buffer_metadata.get('dummy_batch_fields', []):
         try:
           os.unlink(t['path'])
         except FileNotFoundError:

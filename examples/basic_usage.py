@@ -88,6 +88,9 @@ def main() -> None:
     ),
   )
 
+  dummy_batch = train_loader.get_dummy_batch()
+  logger.info("dummy train batch: images %s labels %s", tuple(dummy_batch[0]['images'].shape), tuple(dummy_batch[0]['labels'].shape))
+
   try:
     for name, loader, n_batches in [('train', train_loader, NUM_BATCHES), ('val', val_loader, 5)]:
       for i, batch in zip(range(n_batches), loader):

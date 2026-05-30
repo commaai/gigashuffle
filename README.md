@@ -61,6 +61,7 @@ config = DataloaderConfig(
 )
 
 loader = MultiprocessShuffledDataloader(MyDataset(), config=config)
+dummy_batch = loader.get_dummy_batch()
 
 for batch in loader:
   x = batch[0]['x']
@@ -71,6 +72,8 @@ loader.close()
 ```
 
 Datasets yield a `Buffer`: `list[dict[str, Tensor | ndarray]]`. Every tensor or array in a sample must share the same first dimension; that is the input chunk size. `config.bs` is the output batch size.
+
+Call `loader.get_dummy_batch()` when you need a sanity-check batch before the shuffle buffer reaches `min_mixing`. It repeats the initial sample to `config.bs` and does not advance the normal shuffled iterator.
 
 Inside writer processes, `torch.utils.data.get_worker_info()` is populated with `id`, `num_workers`, `seed`, and `dataset`, so iterable datasets can shard or seed themselves the same way they would under native PyTorch workers.
 
