@@ -28,7 +28,7 @@ class RedisDataset(IterableDataset):
     worker_info = get_worker_info()
     worker_id = -1 if worker_info is None else worker_info.id
     num_workers = 1 if worker_info is None else worker_info.num_workers
-    r.incr(f'{self.key}:iter:{worker_id}')
+    r.incr(f'gigashuffle-{self.key}:iter:{worker_id}')
     i = 0
     while True:
       if i and self.sleep:
@@ -36,7 +36,7 @@ class RedisDataset(IterableDataset):
       x = torch.arange(4, device=self.device)
       if self.device == 'cuda':
         x = (x * 2).cpu()
-      r.incr(f'{self.key}:samples:{worker_id}')
+      r.incr(f'gigashuffle-{self.key}:samples:{worker_id}')
       yield [{'x': x, 'worker_id': torch.full((4,), worker_id), 'num_workers': torch.full((4,), num_workers)}]
       i += 1
 
@@ -81,7 +81,7 @@ def test_dummy_batch_returns_before_min_mixing(tmp_path):
   loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, tmp_path, shuffle_size=64, min_mixing=0.5))
   try:
     batch = loader.get_dummy_batch()
-    assert int(r.scard(f'{queue_name}-full')) < 32
+    assert int(r.scard(f'gigashuffle-{queue_name}-full')) < 32
     assert batch[0]['worker_id'].eq(0).all()
   finally:
     loader.close()
@@ -94,8 +94,8 @@ def test_stats_report_buffer_counts(tmp_path):
   try:
     stats = loader.stats()
     assert isinstance(stats, ShuffleBufferStats)
-    assert stats.full == int(r.scard(f'{queue_name}-full'))
-    assert stats.empty == int(r.scard(f'{queue_name}-empty'))
+    assert stats.full == int(r.scard(f'gigashuffle-{queue_name}-full'))
+    assert stats.empty == int(r.scard(f'gigashuffle-{queue_name}-empty'))
     assert stats.in_flight == 64 - stats.full - stats.empty
   finally:
     loader.close()
@@ -140,16 +140,16 @@ def test_fill_once_loops_in_order(tmp_path):
   loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, tmp_path, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1))
   try:
     deadline = time.perf_counter() + 5
-    while time.perf_counter() < deadline and int(r.scard(f'{queue_name}-full')) < 12:
+    while time.perf_counter() < deadline and int(r.scard(f'gigashuffle-{queue_name}-full')) < 12:
       time.sleep(0.05)
-    assert int(r.scard(f'{queue_name}-full')) == 12
+    assert int(r.scard(f'gigashuffle-{queue_name}-full')) == 12
     shuffle_buffer = attach_named_shuffle_buffer(loader.shuffle_buffer_metadata)
     expected = [shuffle_buffer[0]['x'][0:4].tolist(), shuffle_buffer[0]['x'][4:8].tolist(), shuffle_buffer[0]['x'][8:12].tolist()]
     it = iter(loader)
     assert [next(it)[0]['x'].tolist() for _ in range(3)] == expected
     with pytest.raises(StopIteration):
       next(it)
-    assert int(r.scard(f'{queue_name}-empty')) == 0
+    assert int(r.scard(f'gigashuffle-{queue_name}-empty')) == 0
     writer = loader.children[1]
     deadline = time.perf_counter() + 5
     while time.perf_counter() < deadline and writer.exitcode is None:
@@ -179,8 +179,8 @@ def test_multiple_loaders_fill_together(tmp_path):
   try:
     deadline = time.perf_counter() + 5
     while time.perf_counter() < deadline:
-      n1 = int(r.get(f'{q1}:samples:0') or 0)
-      n2 = int(r.get(f'{q2}:samples:0') or 0)
+      n1 = int(r.get(f'gigashuffle-{q1}:samples:0') or 0)
+      n2 = int(r.get(f'gigashuffle-{q2}:samples:0') or 0)
       if n1 > 1 and n2 > 1:
         break
       time.sleep(0.05)
@@ -198,9 +198,9 @@ def test_worker_info_and_iter_once(tmp_path):
     batch = next(iter(loader))
     assert set(batch[0]['num_workers'].tolist()) == {2}
     deadline = time.perf_counter() + 5
-    while time.perf_counter() < deadline and int(r.get(f'{queue_name}:samples:1') or 0) == 0:
+    while time.perf_counter() < deadline and int(r.get(f'gigashuffle-{queue_name}:samples:1') or 0) == 0:
       time.sleep(0.05)
-    assert [int(r.get(f'{queue_name}:iter:{i}') or 0) for i in range(2)] == [1, 1]
+    assert [int(r.get(f'gigashuffle-{queue_name}:iter:{i}') or 0) for i in range(2)] == [1, 1]
   finally:
     loader.close()
 

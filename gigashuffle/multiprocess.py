@@ -364,7 +364,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
       assert config.min_mixing == 1, "fill_once requires min_mixing == 1"
       assert config.shuffle_size % (config.bs * config.local_world_size) == 0, "fill_once requires shuffle_size to be divisible by bs * local_world_size"
     self.max_iters = config.shuffle_size // (config.bs * config.local_world_size) if config.fill_once else None
-    self.queue_name = config.queue_name
+    self.queue_name = f'gigashuffle-{config.queue_name}'
     self._rank_id = f'global_rank_{config.global_rank}'
     self._closed = False
 
