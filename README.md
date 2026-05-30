@@ -73,6 +73,8 @@ Datasets yield a `Buffer`: `list[dict[str, Tensor | ndarray]]`. Every tensor or 
 
 Call `loader.get_dummy_batch()` when you need a sanity-check batch before the shuffle buffer reaches `min_mixing`. It repeats the initial sample to `config.bs` and does not advance the normal shuffled iterator.
 
+Set `config.fill_once=True` and `config.min_mixing=1` to populate the shuffle buffer once, then yield one ordered pass over it without returning indices to the writers. Readers wait for the full `shuffle_size` before yielding batches in this mode.
+
 Inside writer processes, `torch.utils.data.get_worker_info()` is populated with `id`, `num_workers`, `seed`, and `dataset`, so iterable datasets can shard or seed themselves the same way they would under native PyTorch workers.
 
 `queue_name` is required. Use a different name for every live local loader, for example one name for train and one name for each validation set. On multi-node jobs, include the node rank or hostname in the name because `/dev/shm` is local to one machine.
