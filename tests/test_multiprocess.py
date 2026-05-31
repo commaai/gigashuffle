@@ -11,7 +11,7 @@ from redis import StrictRedis
 from torch.utils.data import IterableDataset, get_worker_info
 
 from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader, ShuffleBufferStats
-from gigashuffle.multiprocess import BatchSizeMismatch, FILL_ONCE_WRITER_DONE_EXITCODE, attach_shuffle_buffer, fetch_initial_sample, get_samples, initialize_redis_queue
+from gigashuffle.multiprocess import BatchSizeMismatch, FILL_ONCE_WRITER_DONE_EXITCODE, attach_buffer_fields, fetch_initial_sample, get_samples, initialize_redis_queue
 
 
 REDIS = dict(host=os.environ.get('REDIS_HOST', 'localhost'), port=int(os.environ.get('REDIS_PORT', '6379')), db=int(os.environ.get('REDIS_DB', '6')))
@@ -137,8 +137,10 @@ def test_initialize_redis_queue_clears_metadata():
   r = StrictRedis(**REDIS)
   queue_name = f'init-{uuid.uuid4().hex}'
   r.set(f'{queue_name}-shared-buffer-meta', b'stale')
+  r.set(f'{queue_name}-shared-buffer-attached', b'99')
   initialize_redis_queue(r, queue_name, 4)
   assert r.get(f'{queue_name}-shared-buffer-meta') is None
+  assert r.get(f'{queue_name}-shared-buffer-attached') is None
   assert int(r.scard(f'{queue_name}-empty')) == 4
   assert int(r.scard(f'{queue_name}-full')) == 0
 
@@ -162,7 +164,7 @@ def test_fill_once_loops_in_order(tmp_path):
     while time.perf_counter() < deadline and int(r.scard(f'gigashuffle-{queue_name}-full')) < 12:
       time.sleep(0.05)
     assert int(r.scard(f'gigashuffle-{queue_name}-full')) == 12
-    shuffle_buffer = attach_shuffle_buffer(loader.shuffle_buffer_metadata)
+    shuffle_buffer = attach_buffer_fields(loader.shuffle_buffer_metadata['fields'])
     expected = [shuffle_buffer[0]['x'][0:4].tolist(), shuffle_buffer[0]['x'][4:8].tolist(), shuffle_buffer[0]['x'][8:12].tolist()]
     it = iter(loader)
     assert [next(it)[0]['x'].tolist() for _ in range(3)] == expected
