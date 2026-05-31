@@ -1,15 +1,17 @@
 import atexit
 import ctypes
+import hashlib
 import logging
 import os
 import pickle
 import random
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from itertools import batched, count
-from multiprocessing import resource_tracker
+from multiprocessing.connection import AuthenticationError, Client, Listener
 from multiprocessing.synchronize import Event
 from multiprocessing.queues import SimpleQueue
 from typing import Any, Iterator, cast
@@ -36,6 +38,13 @@ already_warned = False
 _python_exit_status = False
 
 
+@dataclass(frozen=True, slots=True)
+class ShuffleBufferAttachment:
+  metadata: ShuffleBufferMetadata
+  shuffle_buffer: Buffer
+  dummy_batch: Buffer
+
+
 def _set_python_exit_status() -> None:
   global _python_exit_status
   _python_exit_status = True
@@ -46,6 +55,8 @@ atexit.register(_set_python_exit_status)
 # NOTE: For high-throughput tasks, calling torch.set_num_threads(1) seems to significantly reduce CPU usage in the gigashuffle writers.
 # This SO thread about a similar issue notes that it "was caused by a bad interaction of OpenMP and multiprocessing".
 # https://stackoverflow.com/questions/65057388/pytorch-multiprocessing-with-shared-memory-causes-matmul-to-be-30x-slower-with
+if sys.platform == 'linux':
+  mp.set_sharing_strategy('file_descriptor')
 torch.set_num_threads(1)
 
 
@@ -72,8 +83,12 @@ def init_logger() -> None:
   os.environ["KINETO_LOG_LEVEL"] = "5"
 
 
-def set_process_title(kind: str, config: DataloaderConfig, proc_idx: int, queue_name: str) -> None:
-  setproctitle(f'gigashuffle {kind} {queue_name} local_rank={config.local_rank} proc={proc_idx}')
+def initialize_shuffle_buffer_tensor_ipc() -> bytes:
+  if sys.platform == 'linux':
+    mp.set_sharing_strategy('file_descriptor')
+  authkey = hashlib.blake2b(f'gigashuffle:{os.getuid()}'.encode(), digest_size=32).digest()
+  mp.current_process().authkey = authkey
+  return authkey
 
 
 def _prctl_pr_set_pdeathsig(signum: int) -> None:
@@ -113,7 +128,7 @@ def numpy_type_to_torch(x):
   elif x == np.float32 or x == torch.float32:
     return torch.float32
   else:
-    raise Exception("unsupported numpy type %r" % x)
+    raise Exception(f"unsupported numpy type {x!r}")
 
 
 def get_input_bs_key(samples):
@@ -161,7 +176,7 @@ def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, i
   input_samples, input_bs, input_bs_key = get_samples(dset, max_retries=config.writer_max_retries)
   memory_size = get_memory_size(input_samples, input_bs)
 
-  logger.info("each element uses %d bytes, total buffer size is %.3fgb", memory_size, shuffle_size*memory_size/1e9)
+  logger.info(f"each element uses {memory_size} bytes, total buffer size is {shuffle_size*memory_size/1e9:.3f}gb")
   if shuffle_size < config.bs * config.local_world_size:
     N = config.local_world_size * config.num_readers
     raise RuntimeError(f"Shuffle buffer must be large enough to accommodate at least N batches, but buffer size = {shuffle_size}, batch size = {config.bs}, N = {N}")
@@ -172,9 +187,10 @@ def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, i
 
 
 def initialize_redis_queue(r: StrictRedis, queue_name: str, shuffle_size: int) -> None:
-  logger.info("setting up %s on redis version %s", queue_name, r.execute_command('INFO')['redis_version'])
+  logger.info(f"setting up {queue_name} on redis version {r.execute_command('INFO')['redis_version']}")
   r.delete(f"{queue_name}-shared-buffer-meta")
   r.delete(f"{queue_name}-shared-buffer-attached")
+  r.delete(f"{queue_name}-shared-buffer-attach-socket")
   r.delete(f"{queue_name}-empty")
   r.delete(f"{queue_name}-full")
   for idxs in batched(range(0, shuffle_size), n=CHUNK_SIZE):
@@ -187,11 +203,11 @@ def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixin
     last_log_time = 0.
     while (scard := cast(int, r.scard(queue_name))) < min_mixing_n:
       if log_progress and time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-        logger.info("waiting for %s - %d / %d", queue_name, scard, min_mixing_n)
+        logger.info(f"waiting for {queue_name} - {scard} / {min_mixing_n}")
         last_log_time = time.perf_counter()
       time.sleep(0.1)
     if log_progress:
-      logger.info("%s reached min_mixing_n=%d", queue_name, min_mixing_n)
+      logger.info(f"{queue_name} reached min_mixing_n={min_mixing_n}")
   while True:
     idx_list.extend(int(x) for x in cast(list[bytes], r.spop(queue_name, count - len(idx_list))))
     if len(idx_list) >= count:
@@ -200,33 +216,18 @@ def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixin
   return idx_list
 
 
-def wait_for_shuffle_buffer_attachments(r: StrictRedis, queue_name: str, expected_count: int) -> None:
+def wait_for_shuffle_buffer_attach_count(r: StrictRedis, queue_name: str, expected_count: int) -> None:
   attached_key = f'{queue_name}-shared-buffer-attached'
   last_log_time = 0.
   while (attached_count := int(cast(bytes | int | None, r.get(attached_key)) or 0)) < expected_count:
     if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-      logger.info("waiting for %s - %d / %d", attached_key, attached_count, expected_count)
+      logger.info(f"waiting for {attached_key} - {attached_count} / {expected_count}")
       last_log_time = time.perf_counter()
     time.sleep(0.1)
 
 
-def prevent_resource_tracker_fd_inheritance() -> None:
-  # torch_shm_manager otherwise inherits this pipe and can block Python shutdown.
-  try:
-    os.set_inheritable(resource_tracker.getfd(), False)
-  except Exception:
-    logger.debug("failed to mark resource tracker fd close-on-exec", exc_info=True)
-
-
-def get_shared_storage_metadata(tensor: torch.Tensor) -> dict[str, Any]:
-  prevent_resource_tracker_fd_inheritance()
-  storage = tensor.untyped_storage()
-  manager, handle, size = storage._share_filename_cpu_()
-  return dict(manager=manager, handle=handle, size=size, storage_offset=tensor.storage_offset(), stride=tensor.stride())
-
-
-def create_shuffle_buffer(first_samples: Buffer, shuffle_size: int, input_bs: int, input_bs_key: tuple[int, str], queue_name: str, dummy_bs: int, print_shapes: bool = True) -> tuple[Buffer, Buffer, ShuffleBufferMetadata]:
-  shuffle_buffer_metadata: ShuffleBufferMetadata = dict(queue_name=queue_name, shuffle_size=shuffle_size, input_bs=input_bs, input_bs_key=input_bs_key, fields=[], dummy_fields=[])
+def create_shared_shuffle_buffer_attachment(first_samples: Buffer, shuffle_size: int, input_bs: int, input_bs_key: tuple[int, str], queue_name: str, dummy_bs: int, print_shapes: bool = True) -> ShuffleBufferAttachment:
+  metadata: ShuffleBufferMetadata = dict(queue_name=queue_name, shuffle_size=shuffle_size, input_bs=input_bs, input_bs_key=input_bs_key, fields=[])
   shuffle_buffer = []
 
   for i in range(len(first_samples)):
@@ -236,12 +237,12 @@ def create_shuffle_buffer(first_samples: Buffer, shuffle_size: int, input_bs: in
       shape = tuple([shuffle_size]+list(v.shape[1:]))
       tensor = torch.empty(shape, dtype=dtype).share_memory_()
       if print_shapes:
-        logger.info("allocating shared shape %s for %s with type %s", list(shape), k, dtype)
+        logger.info(f"allocating shared shape {list(shape)} for {k} with type {dtype}")
       b[k] = tensor
-      shuffle_buffer_metadata['fields'].append(dict(i=i, k=k, shape=shape, dtype=str(dtype).removeprefix('torch.'), **get_shared_storage_metadata(tensor)))
+      metadata['fields'].append(dict(i=i, k=k, shape=shape, dtype=str(dtype).removeprefix('torch.'), storage_offset=tensor.storage_offset(), stride=tensor.stride()))
     shuffle_buffer.append(b)
 
-  dummy_buffer = []
+  dummy_batch = []
   idxs = (np.arange(dummy_bs) % input_bs).tolist()
   for i in range(len(first_samples)):
     b = {}
@@ -254,44 +255,92 @@ def create_shuffle_buffer(first_samples: Buffer, shuffle_size: int, input_bs: in
         tmp = tmp.to(device=tensor.device, dtype=tensor.dtype)
       tensor[:] = tmp
       b[k] = tensor
-      shuffle_buffer_metadata['dummy_fields'].append(dict(i=i, k=k, shape=shape, dtype=str(dtype).removeprefix('torch.'), **get_shared_storage_metadata(tensor)))
-    dummy_buffer.append(b)
+    dummy_batch.append(b)
 
-  return shuffle_buffer, dummy_buffer, shuffle_buffer_metadata
-
-
-def attach_shared_tensor(t: dict[str, Any]) -> torch.Tensor:
-  dtype = getattr(torch, t['dtype'])
-  prevent_resource_tracker_fd_inheritance()
-  storage = torch.UntypedStorage._new_shared_filename_cpu(t['manager'], t['handle'], t['size'])
-  return torch.tensor([], dtype=dtype).set_(storage, t['storage_offset'], tuple(t['shape']), tuple(t['stride']))
+  return ShuffleBufferAttachment(metadata=metadata, shuffle_buffer=shuffle_buffer, dummy_batch=dummy_batch)
 
 
-def attach_buffer_fields(fields: list[dict[str, Any]], bs: int | None = None, shared: bool = False) -> Buffer:
-  shuffle_buffer: Buffer = [{} for _ in range(max(t['i'] for t in fields) + 1)]
-  for t in fields:
-    dtype = getattr(torch, t['dtype'])
-    shape = tuple(([bs] if bs is not None else [t['shape'][0]]) + list(t['shape'][1:]))
-    if bs is None:
-      shuffle_buffer[t['i']][t['k']] = attach_shared_tensor(t)
-    else:
-      tensor = torch.empty(shape, dtype=dtype)
-      shuffle_buffer[t['i']][t['k']] = tensor.share_memory_() if shared else tensor
-  return shuffle_buffer
+def start_shuffle_buffer_attach_server(config: DataloaderConfig, queue_name: str, attachment: ShuffleBufferAttachment) -> threading.Thread:
+  authkey = initialize_shuffle_buffer_tensor_ipc()
+  h = hashlib.sha1(f'gigashuffle:{os.getuid()}:{queue_name}'.encode()).hexdigest()[:24]
+  sock_path = f'/tmp/gigashuffle-{os.getuid()}-{h}.sock'
+  attach_key = f'{queue_name}-shared-buffer-attach-socket'
+  r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+
+  try:
+    os.unlink(sock_path)
+  except FileNotFoundError:
+    pass
+
+  listener = Listener(sock_path, family='AF_UNIX', backlog=128, authkey=authkey)
+  r.set(attach_key, sock_path)
+
+  def serve() -> None:
+    try:
+      while True:
+        conn = listener.accept()
+        try:
+          req = conn.recv()
+          if not isinstance(req, dict) or req.get('op') != 'attach':
+            conn.send(dict(ok=False, error='unknown op'))
+            continue
+          conn.send(dict(ok=True, attachment=attachment))
+        except (EOFError, OSError):
+          pass
+        finally:
+          conn.close()
+    finally:
+      listener.close()
+      try:
+        os.unlink(sock_path)
+      except FileNotFoundError:
+        pass
+
+  t = threading.Thread(target=serve, name=f'gigashuffle-attach-{queue_name}', daemon=True)
+  t.start()
+  return t
 
 
-def wait_for_shuffle_buffer_metadata(r: StrictRedis, queue_name: str) -> ShuffleBufferMetadata:
+def attach_to_shared_shuffle_buffer(config: DataloaderConfig, queue_name: str) -> ShuffleBufferAttachment:
+  authkey = initialize_shuffle_buffer_tensor_ipc()
+  attach_key = f'{queue_name}-shared-buffer-attach-socket'
+  r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+  last_log_time = 0.
+  last_error: BaseException | None = None
+
   while True:
-    raw = cast(bytes | None, r.get(f'{queue_name}-shared-buffer-meta'))
-    if raw is not None:
-      return cast(ShuffleBufferMetadata, pickle.loads(raw))
-    time.sleep(0.1)
+    raw = cast(bytes | str | None, r.get(attach_key))
+    if raw is None:
+      if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
+        logger.info(f"waiting for gigashuffle attach server on {attach_key}")
+        last_log_time = time.perf_counter()
+      time.sleep(0.05)
+      continue
+
+    sock_path = raw.decode() if isinstance(raw, bytes) else str(raw)
+    try:
+      conn = Client(sock_path, family='AF_UNIX', authkey=authkey)
+      try:
+        conn.send(dict(op='attach', pid=os.getpid()))
+        msg = conn.recv()
+      finally:
+        conn.close()
+      if not isinstance(msg, dict) or not msg.get('ok'):
+        raise RuntimeError(f"failed to attach to gigashuffle buffer: {msg}")
+      return cast(ShuffleBufferAttachment, msg['attachment'])
+    except (AuthenticationError, ConnectionRefusedError, FileNotFoundError, EOFError, OSError) as e:
+      last_error = e
+      if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
+        logger.info(f"waiting for gigashuffle attach server on {attach_key}: {last_error}")
+        last_log_time = time.perf_counter()
+      time.sleep(0.05)
 
 
-def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Any, Buffer, Buffer | None, ShuffleBufferMetadata]:
+def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Any, Buffer, ShuffleBufferMetadata]:
   init_logger()
-  setproctitle('gigashuffle writer %d %d' % (config.local_rank, proc_idx))
-  os.system('renice -n 3 -p %d > /dev/null' % os.getpid())
+  initialize_shuffle_buffer_tensor_ipc()
+  setproctitle(f'gigashuffle writer {queue_name} local_rank={config.local_rank} proc={proc_idx}')
+  os.system(f'renice -n 3 -p {os.getpid()} > /dev/null')
 
   shuffle_size = config.shuffle_size
   global_proc_idx = config.global_rank * config.num_writers + proc_idx
@@ -307,27 +356,26 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   if local_proc_idx == 0:
     initialize_redis_queue(r, queue_name, shuffle_size)
     input_samples, input_bs, input_bs_key = fetch_initial_sample(dset_iter, config)
-    shuffle_buffer, dummy_buffer, shuffle_buffer_metadata = create_shuffle_buffer(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.bs)
+    attachment = create_shared_shuffle_buffer_attachment(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.bs)
     initial_idx_list = list(range(input_bs))
     r.srem(f'{queue_name}-empty', *initial_idx_list)
-    r.set(f'{queue_name}-shared-buffer-meta', pickle.dumps(shuffle_buffer_metadata))
+    r.set(f'{queue_name}-shared-buffer-meta', pickle.dumps(attachment.metadata))
+    start_shuffle_buffer_attach_server(config, queue_name, attachment)
     expected_attach_count = config.local_world_size * (config.num_writers + config.num_readers) - 1
-    wait_for_shuffle_buffer_attachments(r, queue_name, expected_attach_count)
-    for i in range(len(shuffle_buffer)):
-      for k in shuffle_buffer[i].keys():
+    wait_for_shuffle_buffer_attach_count(r, queue_name, expected_attach_count)
+    for i in range(len(attachment.shuffle_buffer)):
+      for k in attachment.shuffle_buffer[i].keys():
         tmp = torch.as_tensor(input_samples[i][k])
-        if tmp.device != shuffle_buffer[i][k].device or tmp.dtype != shuffle_buffer[i][k].dtype:
-          tmp = tmp.to(device=shuffle_buffer[i][k].device, dtype=shuffle_buffer[i][k].dtype)
-        shuffle_buffer[i][k][initial_idx_list] = tmp
+        if tmp.device != attachment.shuffle_buffer[i][k].device or tmp.dtype != attachment.shuffle_buffer[i][k].dtype:
+          tmp = tmp.to(device=attachment.shuffle_buffer[i][k].device, dtype=attachment.shuffle_buffer[i][k].dtype)
+        attachment.shuffle_buffer[i][k][initial_idx_list] = tmp
     r.sadd(f'{queue_name}-full', *initial_idx_list)
   else:
-    shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(r, queue_name)
-    shuffle_buffer = attach_buffer_fields(shuffle_buffer_metadata['fields'])
-    dummy_buffer = None
+    attachment = attach_to_shared_shuffle_buffer(config, queue_name)
     r.incr(f'{queue_name}-shared-buffer-attached')
 
-  logger.info("writer %d-%d initialized with input_bs %d output_bs %d", config.global_rank, proc_idx, shuffle_buffer_metadata['input_bs'], config.bs)
-  return r, dset_iter, shuffle_buffer, dummy_buffer, shuffle_buffer_metadata
+  logger.info(f"writer {config.global_rank}-{proc_idx} initialized with input_bs {attachment.metadata['input_bs']} output_bs {config.bs}")
+  return r, dset_iter, attachment.shuffle_buffer, attachment.metadata
 
 
 def write_samples_to_buffer(shuffle_buffer: Buffer, samples: Buffer, idx_list: list[int], local_input_bs: int) -> None:
@@ -341,7 +389,7 @@ def write_samples_to_buffer(shuffle_buffer: Buffer, samples: Buffer, idx_list: l
 
 def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
-  r, dset_iter, shuffle_buffer, _dummy_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  r, dset_iter, shuffle_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
   empty_key = f'{queue_name}-empty'
   while True:
     samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'], max_retries=config.writer_max_retries)
@@ -354,19 +402,28 @@ def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
     r.sadd(f'{queue_name}-full', *idx_list)
 
 
+def exit_or_keep_attach_server_alive(owns_attach_server: bool) -> None:
+  if owns_attach_server:
+    # Keep the attach server available for late dummy-batch requests.
+    while True:
+      time.sleep(3600)
+  raise SystemExit(FILL_ONCE_WRITER_DONE_EXITCODE)
+
+
 def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
-  r, dset_iter, shuffle_buffer, _dummy_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  r, dset_iter, shuffle_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  owns_attach_server = config.local_rank * config.num_writers + proc_idx == 0
   empty_key = f'{queue_name}-empty'
   while True:
     empty_n = cast(int, r.scard(empty_key))
     if empty_n == 0:
-      raise SystemExit(FILL_ONCE_WRITER_DONE_EXITCODE)
+      exit_or_keep_attach_server_alive(owns_attach_server)
     samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'], max_retries=config.writer_max_retries)
     local_input_bs = min(local_input_bs, empty_n)
     idx_list = [int(x) for x in cast(list[bytes], r.spop(empty_key, local_input_bs))]
     if not idx_list:
-      raise SystemExit(FILL_ONCE_WRITER_DONE_EXITCODE)
+      exit_or_keep_attach_server_alive(owns_attach_server)
     local_input_bs = len(idx_list)
     write_samples_to_buffer(shuffle_buffer, samples, idx_list, local_input_bs)
     r.sadd(f'{queue_name}-full', *idx_list)
@@ -374,13 +431,17 @@ def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
 
 def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Buffer, Buffer]:
   init_logger()
-  set_process_title('reader', config, proc_idx, queue_name)
+  initialize_shuffle_buffer_tensor_ipc()
+  setproctitle(f'gigashuffle reader {queue_name} local_rank={config.local_rank} proc={proc_idx}')
   r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
-  shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(r, queue_name)
-  shuffle_buffer = attach_buffer_fields(shuffle_buffer_metadata['fields'])
+  attachment = attach_to_shared_shuffle_buffer(config, queue_name)
   r.incr(f'{queue_name}-shared-buffer-attached')
-  reader_buffer = attach_buffer_fields(shuffle_buffer_metadata['fields'], bs=config.bs, shared=True)
-  return r, shuffle_buffer, reader_buffer
+  reader_buffer: Buffer = [{} for _ in range(max(t['i'] for t in attachment.metadata['fields']) + 1)]
+  for t in attachment.metadata['fields']:
+    dtype = getattr(torch, t['dtype'])
+    shape = tuple([config.bs] + list(t['shape'][1:]))
+    reader_buffer[t['i']][t['k']] = torch.empty(shape, dtype=dtype).share_memory_()
+  return r, attachment.shuffle_buffer, reader_buffer
 
 
 def copy_to_reader_buffer(reader_buffer: Buffer, shuffle_buffer: Buffer, idx_list: list[int]) -> None:
@@ -416,11 +477,11 @@ def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
   full_key = f'{queue_name}-full'
   while (scard := cast(int, r.scard(full_key))) < config.shuffle_size:
     if config.local_rank == 0 and time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-      logger.info("waiting for %s - %d / %d", full_key, scard, config.shuffle_size)
+      logger.info(f"waiting for {full_key} - {scard} / {config.shuffle_size}")
       last_log_time = time.perf_counter()
     time.sleep(0.1)
   if config.local_rank == 0:
-    logger.info("%s reached min_mixing_n=%d", full_key, config.shuffle_size)
+    logger.info(f"{full_key} reached min_mixing_n={config.shuffle_size}")
 
   for batch_idx in count():
     start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs % config.shuffle_size
@@ -442,6 +503,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
       assert config.shuffle_size % (config.bs * config.local_world_size) == 0, "fill_once requires shuffle_size to be divisible by bs * local_world_size"
     self.max_iters = config.shuffle_size // (config.bs * config.local_world_size) if config.fill_once else None
     self.queue_name = f'gigashuffle-{config.queue_name}'
+    initialize_shuffle_buffer_tensor_ipc()
     self._shuffle_buffer_metadata: ShuffleBufferMetadata | None = None
     self._dummy_batch: Buffer | None = None
     self._rank_id = f'global_rank_{config.global_rank}'
@@ -473,7 +535,12 @@ class MultiprocessShuffledDataloader(IterableDataset):
   @property
   def shuffle_buffer_metadata(self) -> ShuffleBufferMetadata:
     if self._shuffle_buffer_metadata is None:
-      self._shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(self._r, self.queue_name)
+      while True:
+        raw = cast(bytes | None, self._r.get(f'{self.queue_name}-shared-buffer-meta'))
+        if raw is not None:
+          self._shuffle_buffer_metadata = cast(ShuffleBufferMetadata, pickle.loads(raw))
+          break
+        time.sleep(0.1)
     return self._shuffle_buffer_metadata
 
   def state_dict(self) -> dict[str, Any]:
@@ -486,7 +553,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     if not state_dict:
       return
     if self._rank_id not in state_dict:
-      logger.warning("MultiprocessShuffledDataloader state is empty for global rank %d, expected key %s", self.config.global_rank, self._rank_id)
+      logger.warning(f"MultiprocessShuffledDataloader state is empty for global rank {self.config.global_rank}, expected key {self._rank_id}")
       return
     assert self.config.global_world_size == state_dict['world_size'], "global_world_size is inconsistent before and after checkpoint, dataloader resharding is not supported yet."
     state = pickle.loads(state_dict[self._rank_id])
@@ -495,7 +562,9 @@ class MultiprocessShuffledDataloader(IterableDataset):
 
   def get_dummy_batch(self) -> Buffer:
     if self._dummy_batch is None:
-      self._dummy_batch = attach_buffer_fields(self.shuffle_buffer_metadata['dummy_fields'])
+      attachment = attach_to_shared_shuffle_buffer(self.config, self.queue_name)
+      self._shuffle_buffer_metadata = attachment.metadata
+      self._dummy_batch = attachment.dummy_batch
     return self._dummy_batch
 
   def stats(self) -> ShuffleBufferStats:
