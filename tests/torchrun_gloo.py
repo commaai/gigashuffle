@@ -34,7 +34,6 @@ def main() -> None:
       redis_host=os.environ.get('REDIS_HOST', 'localhost'),
       redis_port=int(os.environ.get('REDIS_PORT', '6379')),
       redis_db=int(os.environ.get('REDIS_DB', '6')),
-      shm_dir=os.environ['GIGASHUFFLE_SHM_DIR'],
       queue_name=queue_name,
     ),
   )
@@ -45,7 +44,6 @@ def main() -> None:
     assert batch[0]['x'].shape == (4,)
     dist.barrier()
   finally:
-    loader.close()
     if dist.is_initialized():
       dist.destroy_process_group()
 

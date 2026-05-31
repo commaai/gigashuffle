@@ -11,7 +11,7 @@ from redis import StrictRedis
 from torch.utils.data import IterableDataset, get_worker_info
 
 from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader, ShuffleBufferStats
-from gigashuffle.multiprocess import BatchSizeMismatch, FILL_ONCE_WRITER_DONE_EXITCODE, attach_named_shuffle_buffer, fetch_initial_sample, get_samples, initialize_redis_queue
+from gigashuffle.multiprocess import BatchSizeMismatch, FILL_ONCE_WRITER_DONE_EXITCODE, attach_shuffle_buffer, fetch_initial_sample, get_samples, initialize_redis_queue
 
 
 REDIS = dict(host=os.environ.get('REDIS_HOST', 'localhost'), port=int(os.environ.get('REDIS_PORT', '6379')), db=int(os.environ.get('REDIS_DB', '6')))
@@ -70,8 +70,8 @@ class SlowFirstSampleDataset(IterableDataset):
       yield [{'x': torch.arange(4)}]
 
 
-def config(queue_name: str, shm_dir: Path, **kwargs) -> DataloaderConfig:
-  opts = dict(bs=4, shuffle_size=32, min_mixing=0.0, num_writers=2, num_readers=2, redis_host=REDIS['host'], redis_port=REDIS['port'], redis_db=REDIS['db'], shm_dir=str(shm_dir), queue_name=queue_name)
+def config(queue_name: str, _tmp_path: Path, **kwargs) -> DataloaderConfig:
+  opts = dict(bs=4, shuffle_size=32, min_mixing=0.0, num_writers=2, num_readers=2, redis_host=REDIS['host'], redis_port=REDIS['port'], redis_db=REDIS['db'], queue_name=queue_name)
   opts.update(kwargs)
   return DataloaderConfig(**opts)
 
@@ -79,7 +79,6 @@ def config(queue_name: str, shm_dir: Path, **kwargs) -> DataloaderConfig:
 def test_torchrun_gloo(tmp_path):
   env = os.environ.copy()
   env['GIGASHUFFLE_QUEUE'] = f'torchrun-{uuid.uuid4().hex}'
-  env['GIGASHUFFLE_SHM_DIR'] = str(tmp_path)
   cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nnodes=1', '--nproc-per-node=2', str(Path(__file__).with_name('torchrun_gloo.py'))]
   result = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=90)
   assert result.returncode == 0, result.stdout + result.stderr
@@ -94,7 +93,7 @@ def test_dummy_batch_returns_before_min_mixing(tmp_path):
     assert int(r.scard(f'gigashuffle-{queue_name}-full')) < 32
     assert batch[0]['worker_id'].eq(0).all()
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 def test_stats_report_buffer_counts(tmp_path):
@@ -108,7 +107,7 @@ def test_stats_report_buffer_counts(tmp_path):
     assert stats.empty == int(r.scard(f'gigashuffle-{queue_name}-empty'))
     assert stats.in_flight == 64 - stats.full - stats.empty
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 def test_init_does_not_wait_for_metadata(tmp_path):
@@ -118,7 +117,7 @@ def test_init_does_not_wait_for_metadata(tmp_path):
   try:
     assert time.perf_counter() - start < 2.0
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 def test_batch_size_mismatch():
@@ -151,7 +150,7 @@ def test_different_input_batch_sizes(tmp_path):
     batch = next(iter(loader))
     assert batch[0]['x'].shape == batch[0]['y'].shape == (4,)
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 def test_fill_once_loops_in_order(tmp_path):
@@ -163,7 +162,7 @@ def test_fill_once_loops_in_order(tmp_path):
     while time.perf_counter() < deadline and int(r.scard(f'gigashuffle-{queue_name}-full')) < 12:
       time.sleep(0.05)
     assert int(r.scard(f'gigashuffle-{queue_name}-full')) == 12
-    shuffle_buffer = attach_named_shuffle_buffer(loader.shuffle_buffer_metadata)
+    shuffle_buffer = attach_shuffle_buffer(loader.shuffle_buffer_metadata)
     expected = [shuffle_buffer[0]['x'][0:4].tolist(), shuffle_buffer[0]['x'][4:8].tolist(), shuffle_buffer[0]['x'][8:12].tolist()]
     it = iter(loader)
     assert [next(it)[0]['x'].tolist() for _ in range(3)] == expected
@@ -177,7 +176,7 @@ def test_fill_once_loops_in_order(tmp_path):
     assert writer.exitcode == FILL_ONCE_WRITER_DONE_EXITCODE
     loader.check_children()
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 def test_fill_once_iters_repeat(tmp_path):
@@ -188,7 +187,7 @@ def test_fill_once_iters_repeat(tmp_path):
     second = [batch[0]['x'].tolist() for batch in loader]
     assert first == second
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 def test_multiple_loaders_fill_together(tmp_path):
@@ -206,8 +205,8 @@ def test_multiple_loaders_fill_together(tmp_path):
       time.sleep(0.05)
     assert n1 > 1 and n2 > 1
   finally:
-    loader1.close()
-    loader2.close()
+    loader1._shutdown_workers()
+    loader2._shutdown_workers()
 
 
 def test_worker_info_and_iter_once(tmp_path):
@@ -222,7 +221,7 @@ def test_worker_info_and_iter_once(tmp_path):
       time.sleep(0.05)
     assert [int(r.get(f'gigashuffle-{queue_name}:iter:{i}') or 0) for i in range(2)] == [1, 1]
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='cuda unavailable')
@@ -233,7 +232,7 @@ def test_cuda_work_inside_worker(tmp_path):
     batch = loader.get_dummy_batch()
     assert batch[0]['x'].tolist() == [0, 2, 4, 6]
   finally:
-    loader.close()
+    loader._shutdown_workers()
 
 
 def test_check_children_health(tmp_path):
@@ -245,4 +244,4 @@ def test_check_children_health(tmp_path):
     with pytest.raises(RuntimeError, match='child'):
       loader.check_children()
   finally:
-    loader.close()
+    loader._shutdown_workers()

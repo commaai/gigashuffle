@@ -66,8 +66,6 @@ for batch in loader:
   x = batch[0]['x']
   y = batch[0]['y']
   break
-
-loader.close()
 ```
 
 Datasets yield a `Buffer`: `list[dict[str, Tensor | ndarray]]`. Every tensor or array in a sample must share the same first dimension; that is the input chunk size. `config.bs` is the output batch size.

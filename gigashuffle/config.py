@@ -17,5 +17,4 @@ class DataloaderConfig:
   redis_host: str = 'localhost'
   redis_port: int = 6379
   redis_db: int = 6
-  shm_dir: str = '/dev/shm'
   queue_name: str = ''

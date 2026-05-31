@@ -120,8 +120,6 @@ def main() -> None:
 
     dist.barrier()
   finally:
-    train_loader.close()
-    val_loader.close()
     if dist.is_initialized():
       dist.destroy_process_group()
 
