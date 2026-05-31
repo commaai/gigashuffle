@@ -61,6 +61,10 @@ def init_logger() -> None:
   os.environ["KINETO_LOG_LEVEL"] = "5"
 
 
+def set_process_title(kind: str, config: DataloaderConfig, proc_idx: int, queue_name: str) -> None:
+  setproctitle(f'gigashuffle {kind} {queue_name} local_rank={config.local_rank} proc={proc_idx}')
+
+
 def print_small_shuffle_warning():
   global already_warned
   if not already_warned:
@@ -233,6 +237,7 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   local_proc_idx = config.local_rank * config.num_writers + proc_idx
   random.seed(global_proc_idx)
   torch.manual_seed(global_proc_idx)
+  np.random.seed(global_proc_idx)
   set_worker_info(dset, worker_id=global_proc_idx, num_workers=total_procs, seed=global_proc_idx)
 
   r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
@@ -301,7 +306,7 @@ def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
 
 def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Buffer, Buffer]:
   init_logger()
-  setproctitle('gigashuffle reader %d %d' % (config.local_rank, proc_idx))
+  set_process_title('reader', config, proc_idx, queue_name)
   r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
   shuffle_buffer_metadata = wait_for_shuffle_buffer_metadata(r, queue_name)
   shuffle_buffer = attach_named_shuffle_buffer(shuffle_buffer_metadata)
