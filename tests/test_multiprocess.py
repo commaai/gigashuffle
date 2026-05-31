@@ -22,10 +22,11 @@ def torch_shm_names() -> set[str]:
 
 
 class RedisDataset(IterableDataset):
-  def __init__(self, key: str, sleep: float = 0.0, device: str = 'cpu') -> None:
+  def __init__(self, key: str, sleep: float = 0.0, device: str = 'cpu', x_offset: int = 0) -> None:
     self.key = key
     self.sleep = sleep
     self.device = device
+    self.x_offset = x_offset
 
   def __iter__(self):
     r = StrictRedis(**REDIS)
@@ -37,7 +38,7 @@ class RedisDataset(IterableDataset):
     while True:
       if i and self.sleep:
         time.sleep(self.sleep)
-      x = torch.arange(4, device=self.device)
+      x = torch.arange(4, device=self.device) + self.x_offset
       if self.device == 'cuda':
         x = (x * 2).cpu()
       r.incr(f'gigashuffle-{self.key}:samples:{worker_id}')
@@ -74,13 +75,13 @@ class SlowFirstSampleDataset(IterableDataset):
       yield [{'x': torch.arange(4)}]
 
 
-def config(queue_name: str, _tmp_path: Path, **kwargs) -> DataloaderConfig:
+def config(queue_name: str, **kwargs) -> DataloaderConfig:
   opts = dict(bs=4, shuffle_size=32, min_mixing=0.0, num_writers=2, num_readers=2, redis_host=REDIS['host'], redis_port=REDIS['port'], redis_db=REDIS['db'], queue_name=queue_name)
   opts.update(kwargs)
   return DataloaderConfig(**opts)
 
 
-def test_torchrun_gloo(tmp_path):
+def test_torchrun_gloo():
   env = os.environ.copy()
   env['GIGASHUFFLE_QUEUE'] = f'torchrun-{uuid.uuid4().hex}'
   cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nnodes=1', '--nproc-per-node=2', str(Path(__file__).with_name('torchrun_gloo.py'))]
@@ -88,10 +89,10 @@ def test_torchrun_gloo(tmp_path):
   assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_dummy_batch_returns_before_min_mixing(tmp_path):
+def test_dummy_batch_returns_before_min_mixing():
   r = StrictRedis(**REDIS)
   queue_name = f'dummy-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, tmp_path, shuffle_size=64, min_mixing=0.5))
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, shuffle_size=64, min_mixing=0.5))
   try:
     batch = loader.get_dummy_batch()
     assert int(r.scard(f'gigashuffle-{queue_name}-full')) < 32
@@ -100,10 +101,10 @@ def test_dummy_batch_returns_before_min_mixing(tmp_path):
     loader._shutdown_workers()
 
 
-def test_stats_report_buffer_counts(tmp_path):
+def test_stats_report_buffer_counts():
   r = StrictRedis(**REDIS)
   queue_name = f'stats-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, tmp_path, shuffle_size=64, min_mixing=0.5))
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, shuffle_size=64, min_mixing=0.5))
   try:
     stats = loader.stats()
     assert isinstance(stats, ShuffleBufferStats)
@@ -114,10 +115,10 @@ def test_stats_report_buffer_counts(tmp_path):
     loader._shutdown_workers()
 
 
-def test_init_does_not_wait_for_metadata(tmp_path):
+def test_init_does_not_wait_for_metadata():
   queue_name = f'lazy-init-{uuid.uuid4().hex}'
   start = time.perf_counter()
-  loader = MultiprocessShuffledDataloader(SlowFirstSampleDataset(sleep=5.0), config(queue_name, tmp_path, num_writers=1, num_readers=0))
+  loader = MultiprocessShuffledDataloader(SlowFirstSampleDataset(sleep=5.0), config(queue_name, num_writers=1, num_readers=0))
   try:
     assert time.perf_counter() - start < 2.0
   finally:
@@ -130,19 +131,19 @@ def test_batch_size_mismatch():
     get_samples(samples)
 
 
-def test_writer_max_retries(tmp_path):
+def test_writer_max_retries():
   writer_max_retries = 3
   samples = iter([[{'x': torch.empty(0)}] for _ in range(writer_max_retries)] + [[{'x': torch.arange(1)}]])
   with pytest.raises(ValueError, match=str(writer_max_retries)):
-    fetch_initial_sample(samples, config(f'retries-{uuid.uuid4().hex}', tmp_path, writer_max_retries=writer_max_retries))
+    fetch_initial_sample(samples, config(f'retries-{uuid.uuid4().hex}', writer_max_retries=writer_max_retries))
 
 
-def test_loader_forces_fd_sharing_without_visible_torch_files(tmp_path):
+def test_loader_forces_fd_sharing_without_visible_torch_files():
   previous_strategy = torch.multiprocessing.get_sharing_strategy()
   before = torch_shm_names()
   torch.multiprocessing.set_sharing_strategy('file_system')
   queue_name = f'fd-shm-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name, tmp_path, num_writers=1, num_readers=1))
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name, num_writers=1, num_readers=1))
   try:
     assert loader.get_dummy_batch()[0]['x'].shape == (4,)
     assert next(iter(loader))[0]['x'].shape == (4,)
@@ -156,9 +157,9 @@ def test_loader_forces_fd_sharing_without_visible_torch_files(tmp_path):
   assert torch_shm_names() - before == set()
 
 
-def test_different_input_batch_sizes(tmp_path):
+def test_different_input_batch_sizes():
   queue_name = f'sizes-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(VariableBatchDataset(), config(queue_name, tmp_path))
+  loader = MultiprocessShuffledDataloader(VariableBatchDataset(), config(queue_name))
   try:
     batch = next(iter(loader))
     assert batch[0]['x'].shape == batch[0]['y'].shape == (4,)
@@ -175,10 +176,10 @@ def test_write_samples_slices_to_acquired_slots():
   assert shuffle_buffer[0]['x'].tolist() == [-1, 0, 1]
 
 
-def test_fill_once_loops_in_order(tmp_path):
+def test_fill_once_loops_in_order():
   r = StrictRedis(**REDIS)
   queue_name = f'fill-once-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, tmp_path, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1, num_writers=1))
+  loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1, num_writers=1))
   try:
     deadline = time.perf_counter() + 5
     while time.perf_counter() < deadline and int(r.scard(f'gigashuffle-{queue_name}-full')) < 12:
@@ -199,9 +200,9 @@ def test_fill_once_loops_in_order(tmp_path):
     loader._shutdown_workers()
 
 
-def test_fill_once_iters_repeat(tmp_path):
+def test_fill_once_iters_repeat():
   queue_name = f'fill-once-repeat-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, tmp_path, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1))
+  loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1))
   try:
     first = [batch[0]['x'].tolist() for batch in loader]
     second = [batch[0]['x'].tolist() for batch in loader]
@@ -210,29 +211,30 @@ def test_fill_once_iters_repeat(tmp_path):
     loader._shutdown_workers()
 
 
-def test_multiple_loaders_fill_together(tmp_path):
-  r = StrictRedis(**REDIS)
+def test_multiple_loaders_fill_together():
   q1, q2 = f'train-{uuid.uuid4().hex}', f'val-{uuid.uuid4().hex}'
-  loader1 = MultiprocessShuffledDataloader(RedisDataset(q1, sleep=0.05), config(q1, tmp_path / 'train'))
-  loader2 = MultiprocessShuffledDataloader(RedisDataset(q2, sleep=0.05), config(q2, tmp_path / 'val'))
+  loader1 = MultiprocessShuffledDataloader(RedisDataset(q1), config(q1))
+  loader2 = MultiprocessShuffledDataloader(RedisDataset(q2, x_offset=100), config(q2))
   try:
-    deadline = time.perf_counter() + 5
-    while time.perf_counter() < deadline:
-      n1 = int(r.get(f'gigashuffle-{q1}:samples:0') or 0)
-      n2 = int(r.get(f'gigashuffle-{q2}:samples:0') or 0)
-      if n1 > 1 and n2 > 1:
-        break
-      time.sleep(0.05)
-    assert n1 > 1 and n2 > 1
+    dummy1 = loader1.get_dummy_batch()
+    dummy2 = loader2.get_dummy_batch()
+    batch1 = next(iter(loader1))
+    batch2 = next(iter(loader2))
+    assert dummy1[0]['num_workers'].eq(2).all()
+    assert dummy2[0]['num_workers'].eq(2).all()
+    assert batch1[0]['x'].shape == (4,)
+    assert batch2[0]['x'].shape == (4,)
+    assert not torch.equal(dummy1[0]['x'], dummy2[0]['x'])
+    assert not torch.equal(batch1[0]['x'], batch2[0]['x'])
   finally:
     loader1._shutdown_workers()
     loader2._shutdown_workers()
 
 
-def test_worker_info_and_iter_once(tmp_path):
+def test_worker_info_and_iter_once():
   r = StrictRedis(**REDIS)
   queue_name = f'workers-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name, tmp_path, num_writers=2))
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name, num_writers=2))
   try:
     batch = next(iter(loader))
     assert set(batch[0]['num_workers'].tolist()) == {2}
@@ -245,9 +247,9 @@ def test_worker_info_and_iter_once(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='cuda unavailable')
-def test_cuda_work_inside_worker(tmp_path):
+def test_cuda_work_inside_worker():
   queue_name = f'cuda-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, device='cuda'), config(queue_name, tmp_path))
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, device='cuda'), config(queue_name))
   try:
     batch = loader.get_dummy_batch()
     assert batch[0]['x'].tolist() == [0, 2, 4, 6]
@@ -255,9 +257,9 @@ def test_cuda_work_inside_worker(tmp_path):
     loader._shutdown_workers()
 
 
-def test_check_children_health(tmp_path):
+def test_check_children_health():
   queue_name = f'health-{uuid.uuid4().hex}'
-  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name, tmp_path))
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name))
   try:
     loader.children[0].terminate()
     loader.children[0].join(timeout=5)

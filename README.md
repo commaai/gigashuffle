@@ -73,3 +73,6 @@ Datasets yield a `Buffer`: `list[dict[str, Tensor | ndarray]]`. Every tensor or 
 Call `loader.get_dummy_batch()` when you need a sanity-check batch before the shuffle buffer reaches `min_mixing`. It repeats the initial sample to `config.bs` and does not advance the normal shuffled iterator.
 
 Set `config.fill_once=True`, `config.min_mixing=1`, and `config.num_readers=1` to populate the shuffle buffer once, then yield one ordered pass over it without returning indices to the writers. Reader waits for the full `shuffle_size` before yielding batches in this mode.
+
+## Notes
+Each Dataloader owns one shared CPU shuffle buffer. The owner writer (`proc_idx=0`) allocates the buffer with `Tensor.share_memory_()` using PyTorch's `file_descriptor` CPU sharing strategy, publishes only an `AF_UNIX` attach-socket path in Redis, and sends the shared tensor objects over that socket; this follows the same fd-transfer mechanism PyTorch uses for CPU tensor IPC. The simpler alternatives do not work well here: a `multiprocessing.Queue` object cannot be shared across independent `torchrun` ranks, Redis cannot transmit process-local file descriptors, explicit `/dev/shm` or `torch.from_file` names can leak after killed workers, and `/proc/<pid>/fd/<fd>` attachment is Linux/container-permission fragile and races owner death.
