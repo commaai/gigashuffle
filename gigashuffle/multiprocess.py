@@ -619,8 +619,10 @@ class MultiprocessShuffledDataloader(IterableDataset):
     while True:
       if not self.ready_q.empty():
         buf, idx = self.ready_q.get()
-        yield buf
-        self.ready_e[idx].set()
+        try:
+          yield buf
+        finally:
+          self.ready_e[idx].set()
         yielded += 1
         if self.max_iters is not None and yielded >= self.max_iters:
           return
