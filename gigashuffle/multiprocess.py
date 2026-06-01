@@ -191,6 +191,7 @@ def initialize_redis_queue(r: StrictRedis, queue_name: str, shuffle_size: int) -
   r.delete(f"{queue_name}-shared-buffer-meta")
   r.delete(f"{queue_name}-shared-buffer-attached")
   r.delete(f"{queue_name}-shared-buffer-attach-socket")
+  r.delete(f"{queue_name}-initializing")
   r.delete(f"{queue_name}-empty")
   r.delete(f"{queue_name}-full")
   for idxs in batched(range(0, shuffle_size), n=CHUNK_SIZE):
@@ -355,6 +356,7 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   dset_iter = iter(dset) if hasattr(dset, '__iter__') else dset
   if local_proc_idx == 0:
     initialize_redis_queue(r, queue_name, shuffle_size)
+    r.set(f'{queue_name}-initializing', 1)
     input_samples, input_bs, input_bs_key = fetch_initial_sample(dset_iter, config)
     attachment = create_shared_shuffle_buffer_attachment(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.bs)
     initial_idx_list = list(range(input_bs))
@@ -370,6 +372,7 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
           tmp = tmp.to(device=attachment.shuffle_buffer[i][k].device, dtype=attachment.shuffle_buffer[i][k].dtype)
         attachment.shuffle_buffer[i][k][initial_idx_list] = tmp
     r.sadd(f'{queue_name}-full', *initial_idx_list)
+    r.delete(f'{queue_name}-initializing')
   else:
     attachment = attach_to_shared_shuffle_buffer(config, queue_name)
     r.incr(f'{queue_name}-shared-buffer-attached')

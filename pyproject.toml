@@ -15,6 +15,9 @@ dependencies = [
   "torch",
 ]
 
+[project.scripts]
+gigashuffle-stats = "gigashuffle.stats:main"
+
 [tool.setuptools.packages.find]
 include = ["gigashuffle", "gigashuffle.*"]
 
