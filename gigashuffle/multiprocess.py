@@ -83,6 +83,13 @@ def init_logger() -> None:
   os.environ["KINETO_LOG_LEVEL"] = "5"
 
 
+def get_elapsed_and_eta(now: float, start_time: float, current: int, start_current: int, target: int) -> tuple[float, float]:
+  elapsed_s = now - start_time
+  progress = current - start_current
+  eta_s = (target - current) * elapsed_s / progress if progress > 0 else float('nan')
+  return elapsed_s, eta_s
+
+
 def initialize_shuffle_buffer_tensor_ipc() -> bytes:
   if sys.platform == 'linux':
     mp.set_sharing_strategy('file_descriptor')
@@ -202,13 +209,19 @@ def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixin
   idx_list: list[int] = []
   if min_mixing_n is not None:
     last_log_time = 0.
-    while (scard := cast(int, r.scard(queue_name))) < min_mixing_n:
-      if log_progress and time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-        logger.info(f"waiting for {queue_name} - {scard} / {min_mixing_n}")
-        last_log_time = time.perf_counter()
+    wait_start_time = time.perf_counter()
+    scard = cast(int, r.scard(queue_name))
+    wait_start_scard = scard
+    while scard < min_mixing_n:
+      now = time.perf_counter()
+      if log_progress and now - last_log_time >= LOG_INTERVAL_S:
+        elapsed_s, eta_s = get_elapsed_and_eta(now, wait_start_time, scard, wait_start_scard, min_mixing_n)
+        logger.info(f"waiting for {queue_name} - {scard} / {min_mixing_n} ({elapsed_s:.0f}s/{eta_s:.0f}s)")
+        last_log_time = now
       time.sleep(0.1)
+      scard = cast(int, r.scard(queue_name))
     if log_progress:
-      logger.info(f"{queue_name} reached min_mixing_n={min_mixing_n}")
+      logger.info(f"{queue_name} reached {min_mixing_n}")
   while True:
     idx_list.extend(int(x) for x in cast(list[bytes], r.spop(queue_name, count - len(idx_list))))
     if len(idx_list) >= count:
@@ -478,13 +491,19 @@ def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
 
   last_log_time = 0.
   full_key = f'{queue_name}-full'
-  while (scard := cast(int, r.scard(full_key))) < config.shuffle_size:
-    if config.local_rank == 0 and time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-      logger.info(f"waiting for {full_key} - {scard} / {config.shuffle_size}")
-      last_log_time = time.perf_counter()
+  wait_start_time = time.perf_counter()
+  scard = cast(int, r.scard(full_key))
+  wait_start_scard = scard
+  while scard < config.shuffle_size:
+    now = time.perf_counter()
+    if config.local_rank == 0 and now - last_log_time >= LOG_INTERVAL_S:
+      elapsed_s, eta_s = get_elapsed_and_eta(now, wait_start_time, scard, wait_start_scard, config.shuffle_size)
+      logger.info(f"waiting for {full_key} - {scard} / {config.shuffle_size} ({elapsed_s:.0f}s/{eta_s:.0f}s)")
+      last_log_time = now
     time.sleep(0.1)
+    scard = cast(int, r.scard(full_key))
   if config.local_rank == 0:
-    logger.info(f"{full_key} reached min_mixing_n={config.shuffle_size}")
+    logger.info(f"{full_key} reached {config.shuffle_size}")
 
   for batch_idx in count():
     start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs % config.shuffle_size
