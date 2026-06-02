@@ -26,11 +26,9 @@ class MyDataset(IterableDataset):
       y = torch.randint(0, 1000, (64,))
       yield [{'x': x, 'y': y}]
 
-dist.init_process_group(backend='gloo')
-
 config = DataloaderConfig(
   bs=32,
-  shuffle_size=10000,
+  shuffle_size=1000,
   num_writers=2,
   num_readers=2,
   local_rank=int(os.environ.get('LOCAL_RANK', '0')),
