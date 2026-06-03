@@ -473,7 +473,8 @@ def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event,
   ready_e.clear()
 
 
-def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, proc_idx: int, queue_name: str, parent_pid: int):
+def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
+  assert request_batch_q is None
   set_parent_death_signal(parent_pid)
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
   min_mixing_n = int(config.min_mixing * config.shuffle_size)
@@ -485,7 +486,8 @@ def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
-def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, proc_idx: int, queue_name: str, parent_pid: int):
+def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
+  assert request_batch_q is not None
   set_parent_death_signal(parent_pid)
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
 
@@ -505,8 +507,9 @@ def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
   if config.local_rank == 0:
     logger.info(f"{full_key} reached {config.shuffle_size}")
 
-  for batch_idx in count():
-    start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs % config.shuffle_size
+  while True:
+    batch_idx = request_batch_q.get()
+    start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs
     idx_list = list(range(start_idx, start_idx + config.bs))
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
@@ -540,6 +543,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     ctx = mp.get_context('spawn')
     self.ready_q: SimpleQueue[tuple[Buffer, int]] = ctx.SimpleQueue()
     self.ready_e = [ctx.Event() for _ in range(self.config.num_readers)]
+    self.request_batch_q: SimpleQueue[int] | None = ctx.SimpleQueue() if config.fill_once else None
     self.children = []
     self.check_child_time = 0.
 
@@ -547,7 +551,8 @@ class MultiprocessShuffledDataloader(IterableDataset):
     writer_fn = fill_once_writer if config.fill_once else streaming_writer
     parent_pid = os.getpid()
     for i in range(self.config.num_readers):
-      self.children.append(ctx.Process(target=reader_fn, args=(config, self.ready_q, self.ready_e[i], i, self.queue_name, parent_pid), daemon=True))
+      args = (config, self.ready_q, self.ready_e[i], self.request_batch_q, i, self.queue_name, parent_pid)
+      self.children.append(ctx.Process(target=reader_fn, args=args, daemon=True))
     for i in range(self.config.num_writers):
       self.children.append(ctx.Process(target=writer_fn, args=(dset, config, i, self.queue_name, parent_pid), daemon=True))
 
@@ -629,6 +634,8 @@ class MultiprocessShuffledDataloader(IterableDataset):
         p.join(timeout=max(0, kill_deadline - time.perf_counter()))
       if ready_q := getattr(self, 'ready_q', None):
         ready_q.close()
+      if request_batch_q := getattr(self, 'request_batch_q', None):
+        request_batch_q.close()
 
   def __del__(self) -> None:
     try:
@@ -638,18 +645,31 @@ class MultiprocessShuffledDataloader(IterableDataset):
 
   def __iter__(self) -> Iterator[Buffer]:
     yielded = 0
+    if self.config.fill_once:
+      max_iters = cast(int, self.max_iters)
+      assert self.request_batch_q is not None
+      self.ready_e[0].set()
+      self.request_batch_q.put(0)
+
     while True:
+      if time.perf_counter() - self.check_child_time > 1.0:
+        self.check_children()
+
       if not self.ready_q.empty():
         buf, idx = self.ready_q.get()
+      else:
+        time.sleep(0.001)
+        continue
+
+      if self.config.fill_once:
+        yield buf
+        self.ready_e[idx].set()
+        yielded += 1
+        if yielded >= max_iters:
+          return
+        self.request_batch_q.put(yielded)
+      else:
         try:
           yield buf
         finally:
           self.ready_e[idx].set()
-        yielded += 1
-        if self.max_iters is not None and yielded >= self.max_iters:
-          return
-      else:
-        time.sleep(0.001)
-
-      if time.perf_counter() - self.check_child_time > 1.0:
-        self.check_children()
