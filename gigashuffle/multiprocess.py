@@ -405,10 +405,10 @@ def write_samples_to_buffer(shuffle_buffer: Buffer, samples: Buffer, idx_list: l
 
 def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
-  r, dset_iter, shuffle_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  r, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
   empty_key = f'{queue_name}-empty'
   while True:
-    samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'], max_retries=config.writer_max_retries)
+    samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
     max_input_bs = (config.shuffle_size - config.bs) // (config.local_world_size * config.num_writers)
     if local_input_bs > max_input_bs:
       local_input_bs = max_input_bs
@@ -428,14 +428,14 @@ def exit_or_keep_attach_server_alive(owns_attach_server: bool) -> None:
 
 def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
-  r, dset_iter, shuffle_buffer, shuffle_buffer_metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  r, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
   owns_attach_server = config.local_rank * config.num_writers + proc_idx == 0
   empty_key = f'{queue_name}-empty'
   while True:
     empty_n = cast(int, r.scard(empty_key))
     if empty_n == 0:
       exit_or_keep_attach_server_alive(owns_attach_server)
-    samples, local_input_bs, _ = get_samples(dset_iter, shuffle_buffer_metadata['input_bs_key'], max_retries=config.writer_max_retries)
+    samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
     local_input_bs = min(local_input_bs, empty_n)
     idx_list = [int(x) for x in cast(list[bytes], r.spop(empty_key, local_input_bs))]
     if not idx_list:
@@ -529,7 +529,6 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self.max_iters = config.shuffle_size // (config.bs * config.local_world_size) if config.fill_once else None
     self.queue_name = f'gigashuffle-{config.queue_name}'
     initialize_shuffle_buffer_tensor_ipc()
-    self._shuffle_buffer_metadata: ShuffleBufferMetadata | None = None
     self._dummy_batch: Buffer | None = None
     self._rank_id = f'global_rank_{config.global_rank}'
     self._shutdown = False
@@ -559,17 +558,6 @@ class MultiprocessShuffledDataloader(IterableDataset):
     for i, p in enumerate(self.children):
       p.start()
 
-  @property
-  def shuffle_buffer_metadata(self) -> ShuffleBufferMetadata:
-    if self._shuffle_buffer_metadata is None:
-      while True:
-        raw = cast(bytes | None, self._r.get(f'{self.queue_name}-shared-buffer-meta'))
-        if raw is not None:
-          self._shuffle_buffer_metadata = cast(ShuffleBufferMetadata, pickle.loads(raw))
-          break
-        time.sleep(0.1)
-    return self._shuffle_buffer_metadata
-
   def state_dict(self) -> dict[str, Any]:
     state = {}
     if hasattr(self.dset, 'state_dict'):
@@ -589,8 +577,11 @@ class MultiprocessShuffledDataloader(IterableDataset):
 
   def get_dummy_batch(self) -> Buffer:
     if self._dummy_batch is None:
+      while self._r.get(f'{self.queue_name}-shared-buffer-meta') is None:
+        if time.perf_counter() - self.check_child_time > 1.0:
+          self.check_children()
+        time.sleep(0.1)
       attachment = attach_to_shared_shuffle_buffer(self.config, self.queue_name)
-      self._shuffle_buffer_metadata = attachment.metadata
       self._dummy_batch = attachment.dummy_batch
     return self._dummy_batch
 

@@ -75,6 +75,11 @@ class SlowFirstSampleDataset(IterableDataset):
       yield [{'x': torch.arange(4)}]
 
 
+class FailingFirstSampleDataset(IterableDataset):
+  def __iter__(self):
+    raise RuntimeError("intentional dataset failure")
+
+
 def config(queue_name: str, **kwargs) -> DataloaderConfig:
   opts = dict(bs=4, shuffle_size=32, min_mixing=0.0, num_writers=2, num_readers=2, redis_host=REDIS['host'], redis_port=REDIS['port'], redis_db=REDIS['db'], queue_name=queue_name)
   opts.update(kwargs)
@@ -97,6 +102,16 @@ def test_dummy_batch_returns_before_min_mixing():
     batch = loader.get_dummy_batch()
     assert int(r.scard(f'gigashuffle-{queue_name}-full')) < 32
     assert batch[0]['worker_id'].eq(0).all()
+  finally:
+    loader._shutdown_workers()
+
+
+def test_get_dummy_batch_aborts_when_writer_dies_before_attach_server():
+  queue_name = f'dummy-dead-writer-{uuid.uuid4().hex}'
+  loader = MultiprocessShuffledDataloader(FailingFirstSampleDataset(), config(queue_name, num_writers=1, num_readers=0))
+  try:
+    with pytest.raises(RuntimeError, match="child .* died"):
+      loader.get_dummy_batch()
   finally:
     loader._shutdown_workers()
 
