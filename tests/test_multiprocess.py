@@ -1,8 +1,10 @@
 import os
+import pickle
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -63,6 +65,24 @@ class OrderedDataset(IterableDataset):
       start = i * 4
       yield [{'x': torch.arange(start, start + 4)}]
       i += 1
+
+
+@dataclass(frozen=True)
+class TrainingContext:
+  epoch: int
+  step: int
+  device: torch.device
+
+
+class TrainingContextDataset(IterableDataset):
+  def __init__(self, key: str) -> None:
+    self.key = key
+    self.context = None
+
+  def __iter__(self):
+    while True:
+      epoch = -1 if self.context is None else self.context.epoch
+      yield [{'epoch': torch.full((1,), epoch)}]
 
 
 class SlowFirstSampleDataset(IterableDataset):
@@ -272,6 +292,25 @@ def test_worker_info_and_iter_once():
       time.sleep(0.05)
     assert [int(r.get(f'gigashuffle-{queue_name}:iter:{i}') or 0) for i in range(2)] == [1, 1]
   finally:
+    loader._shutdown_workers()
+
+
+def test_attach_training_context_updates_writer_dataset_epoch():
+  r = StrictRedis(**REDIS)
+  queue_name = f'context-{uuid.uuid4().hex}'
+  context = TrainingContext(epoch=7, step=3, device=torch.device('cpu'))
+  r.set(f'gigashuffle-{queue_name}-training-context-global_rank_0', pickle.dumps(context))
+  loader = MultiprocessShuffledDataloader(TrainingContextDataset(queue_name), config(queue_name, bs=1, shuffle_size=3, num_writers=1, num_readers=1))
+  iloader = iter(loader)
+  try:
+    batch = next(iloader)
+    loader.attach_training_context(context)
+    assert batch[0]['epoch'].item() == -1
+    for _ in range(10):
+      batch = next(iloader)
+    assert batch[0]['epoch'].item() == 7
+  finally:
+    del iloader
     loader._shutdown_workers()
 
 

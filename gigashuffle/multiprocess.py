@@ -27,6 +27,7 @@ from gigashuffle.config import DataloaderConfig
 
 
 Buffer = list[dict[str, torch.Tensor]]
+RANK_ID_FORMAT = 'global_rank_{global_rank}'
 CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
 PR_SET_PDEATHSIG = 1
@@ -407,7 +408,11 @@ def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
   set_parent_death_signal(parent_pid)
   r, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
   empty_key = f'{queue_name}-empty'
+  rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
   while True:
+    training_context = cast(bytes | None, r.get(f'{queue_name}-training-context-{rank_id}'))
+    if training_context is not None:
+      dset.context = pickle.loads(training_context)
     samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
     max_input_bs = (config.shuffle_size - config.bs) // (config.local_world_size * config.num_writers)
     if local_input_bs > max_input_bs:
@@ -431,7 +436,11 @@ def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
   r, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
   owns_attach_server = config.local_rank * config.num_writers + proc_idx == 0
   empty_key = f'{queue_name}-empty'
+  rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
   while True:
+    training_context = cast(bytes | None, r.get(f'{queue_name}-training-context-{rank_id}'))
+    if training_context is not None:
+      dset.context = pickle.loads(training_context)
     empty_n = cast(int, r.scard(empty_key))
     if empty_n == 0:
       exit_or_keep_attach_server_alive(owns_attach_server)
@@ -530,7 +539,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self.queue_name = f'gigashuffle-{config.queue_name}'
     initialize_shuffle_buffer_tensor_ipc()
     self._dummy_batch: Buffer | None = None
-    self._rank_id = f'global_rank_{config.global_rank}'
+    self._rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
     self._shutdown = False
 
     self._r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
@@ -538,6 +547,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
       assert self._r.ping()
     except Exception as e:
       raise AssertionError(f"Redis is not reachable at {config.redis_host}:{config.redis_port}/{config.redis_db}") from e
+    self._r.delete(f'{self.queue_name}-training-context-{self._rank_id}')
 
     ctx = mp.get_context('spawn')
     self.ready_q: SimpleQueue[tuple[Buffer, int]] = ctx.SimpleQueue()
@@ -557,6 +567,9 @@ class MultiprocessShuffledDataloader(IterableDataset):
 
     for i, p in enumerate(self.children):
       p.start()
+
+  def attach_training_context(self, context: Any) -> None:
+    self._r.set(f'{self.queue_name}-training-context-{self._rank_id}', pickle.dumps(context))
 
   def state_dict(self) -> dict[str, Any]:
     state = {}
