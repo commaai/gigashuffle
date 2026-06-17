@@ -482,6 +482,15 @@ def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event,
   ready_e.clear()
 
 
+def partition_reinsert(idx_list: list[int], reinsert_prob: float) -> tuple[list[int], list[int]]:
+  if reinsert_prob <= 0:
+    return [], idx_list
+  reinsert, free = [], []
+  for idx in idx_list:
+    (reinsert if random.random() < reinsert_prob else free).append(idx)
+  return reinsert, free
+
+
 def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
   assert request_batch_q is None
   set_parent_death_signal(parent_pid)
@@ -491,7 +500,11 @@ def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
   for batch_idx in count():
     idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    r.sadd(f'{queue_name}-empty', *idx_list)
+    reinsert, free = partition_reinsert(idx_list, config.reinsert_prob)
+    if reinsert:
+      r.sadd(f'{queue_name}-full', *reinsert)
+    if free:
+      r.sadd(f'{queue_name}-empty', *free)
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
@@ -531,6 +544,8 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self.config = config
     assert config.num_writers > 0, "gigashuffle requires num_writers > 0"
     assert config.queue_name, "MultiprocessShuffledDataloader requires config.queue_name"
+    assert 0.0 <= config.reinsert_prob <= 1.0, "reinsert_prob must be between 0.0 and 1.0"
+    assert not (config.fill_once and config.reinsert_prob > 0.0), "reinsert_prob is not supported with fill_once"
     if config.fill_once:
       assert config.num_readers == 1, "fill_once requires num_readers == 1"
       assert config.min_mixing == 1, "fill_once requires min_mixing == 1"

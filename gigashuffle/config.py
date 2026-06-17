@@ -6,6 +6,7 @@ class DataloaderConfig:
   bs: int
   shuffle_size: int
   min_mixing: float = 0.5
+  reinsert_prob: float = 0.0
   num_writers: int = 2
   num_readers: int = 2
   writer_max_retries: int = 100

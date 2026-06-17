@@ -13,7 +13,7 @@ from redis import StrictRedis
 from torch.utils.data import IterableDataset, get_worker_info
 
 from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader, ShuffleBufferStats
-from gigashuffle.multiprocess import BatchSizeMismatch, fetch_initial_sample, get_samples, write_samples_to_buffer
+from gigashuffle.multiprocess import BatchSizeMismatch, fetch_initial_sample, get_samples, partition_reinsert, write_samples_to_buffer
 
 
 REDIS = dict(host=os.environ.get('REDIS_HOST', 'localhost'), port=int(os.environ.get('REDIS_PORT', '6379')), db=int(os.environ.get('REDIS_DB', '6')))
@@ -209,6 +209,14 @@ def test_write_samples_slices_to_acquired_slots():
   write_samples_to_buffer(shuffle_buffer, samples, [1, 2], local_input_bs=2)
 
   assert shuffle_buffer[0]['x'].tolist() == [-1, 0, 1]
+
+
+def test_partition_reinsert_splits_without_losing_indices():
+  idx_list = list(range(100))
+  assert partition_reinsert(idx_list, 0.0) == ([], idx_list)
+  assert partition_reinsert(idx_list, 1.0) == (idx_list, [])
+  reinsert, free = partition_reinsert(idx_list, 0.5)
+  assert sorted(reinsert + free) == idx_list
 
 
 def test_fill_once_loops_in_order():
