@@ -27,6 +27,7 @@ from gigashuffle.config import DataloaderConfig
 
 
 Buffer = list[dict[str, torch.Tensor]]
+ReaderBatch = tuple[Buffer, int, list[int]]
 RANK_ID_FORMAT = 'global_rank_{global_rank}'
 CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
@@ -475,40 +476,29 @@ def copy_to_reader_buffer(reader_buffer: Buffer, shuffle_buffer: Buffer, idx_lis
       reader_buffer[buffer_idx][k][:] = shuffle_buffer[buffer_idx][k][idx_list]
 
 
-def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, reader_buffer: Buffer, proc_idx: int) -> None:
-  ready_q.put((reader_buffer, proc_idx))
+def send_reader_buffer(ready_q: SimpleQueue[ReaderBatch], ready_e: Event, reader_buffer: Buffer, proc_idx: int, idx_list: list[int]) -> None:
+  ready_q.put((reader_buffer, proc_idx, idx_list))
   while not ready_e.is_set():
     ready_e.wait()
   ready_e.clear()
 
 
-def partition_reinsert(idx_list: list[int], reinsert_prob: float) -> tuple[list[int], list[int]]:
-  if reinsert_prob <= 0:
-    return [], idx_list
-  reinsert, free = [], []
-  for idx in idx_list:
-    (reinsert if random.random() < reinsert_prob else free).append(idx)
-  return reinsert, free
-
-
-def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
+def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[ReaderBatch], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
   assert request_batch_q is None
   set_parent_death_signal(parent_pid)
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
   min_mixing_n = int(config.min_mixing * config.shuffle_size)
+  full_key, empty_key = f'{queue_name}-full', f'{queue_name}-empty'
+  return_key = empty_key if config.evict_on_read else full_key
 
   for batch_idx in count():
-    idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
+    idx_list = fetch_rand_from_queue(r, full_key, config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    reinsert, free = partition_reinsert(idx_list, config.reinsert_prob)
-    if reinsert:
-      r.sadd(f'{queue_name}-full', *reinsert)
-    if free:
-      r.sadd(f'{queue_name}-empty', *free)
-    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
+    r.sadd(return_key, *idx_list)
+    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx, idx_list)
 
 
-def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
+def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[ReaderBatch], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
   assert request_batch_q is not None
   set_parent_death_signal(parent_pid)
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
@@ -534,7 +524,7 @@ def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
     start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs
     idx_list = list(range(start_idx, start_idx + config.bs))
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
+    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx, idx_list)
 
 
 class MultiprocessShuffledDataloader(IterableDataset):
@@ -544,8 +534,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self.config = config
     assert config.num_writers > 0, "gigashuffle requires num_writers > 0"
     assert config.queue_name, "MultiprocessShuffledDataloader requires config.queue_name"
-    assert 0.0 <= config.reinsert_prob <= 1.0, "reinsert_prob must be between 0.0 and 1.0"
-    assert not (config.fill_once and config.reinsert_prob > 0.0), "reinsert_prob is not supported with fill_once"
+    assert not (config.fill_once and not config.evict_on_read), "evict_on_read=False is not supported with fill_once"
     if config.fill_once:
       assert config.num_readers == 1, "fill_once requires num_readers == 1"
       assert config.min_mixing == 1, "fill_once requires min_mixing == 1"
@@ -565,7 +554,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self._r.delete(f'{self.queue_name}-training-context-{self._rank_id}')
 
     ctx = mp.get_context('spawn')
-    self.ready_q: SimpleQueue[tuple[Buffer, int]] = ctx.SimpleQueue()
+    self.ready_q: SimpleQueue[ReaderBatch] = ctx.SimpleQueue()
     self.ready_e = [ctx.Event() for _ in range(self.config.num_readers)]
     self.request_batch_q: SimpleQueue[int] | None = ctx.SimpleQueue() if config.fill_once else None
     self.children = []
@@ -622,6 +611,19 @@ class MultiprocessShuffledDataloader(IterableDataset):
     in_flight = self.config.shuffle_size - full - empty
     return ShuffleBufferStats(full=full, empty=empty, in_flight=in_flight)
 
+  def evict(self, indices: list[int]) -> int:
+    assert not self.config.evict_on_read, "evict() requires evict_on_read=False"
+    if not (indices := [int(i) for i in indices]):
+      return 0
+    full_key, empty_key = f'{self.queue_name}-full', f'{self.queue_name}-empty'
+    with self._r.pipeline(transaction=False) as pipe:
+      for idx in indices:
+        pipe.srem(full_key, idx)
+      removed = pipe.execute()
+    if freed := [idx for idx, ok in zip(indices, removed) if ok]:
+      self._r.sadd(empty_key, *freed)
+    return len(freed)
+
   def check_children(self) -> None:
     for i, p in enumerate(self.children):
       if not p.is_alive():
@@ -662,7 +664,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     except Exception:
       pass
 
-  def __iter__(self) -> Iterator[Buffer]:
+  def __iter__(self) -> Iterator[Buffer | tuple[Buffer, list[int]]]:
     yielded = 0
     if self.config.fill_once:
       max_iters = cast(int, self.max_iters)
@@ -675,13 +677,15 @@ class MultiprocessShuffledDataloader(IterableDataset):
         self.check_children()
 
       if not self.ready_q.empty():
-        buf, idx = self.ready_q.get()
+        buf, idx, idx_list = self.ready_q.get()
       else:
         time.sleep(0.001)
         continue
 
+      batch = buf if self.config.evict_on_read else (buf, idx_list)
+
       if self.config.fill_once:
-        yield buf
+        yield batch
         self.ready_e[idx].set()
         yielded += 1
         if yielded >= max_iters:
@@ -689,6 +693,6 @@ class MultiprocessShuffledDataloader(IterableDataset):
         self.request_batch_q.put(yielded)
       else:
         try:
-          yield buf
+          yield batch
         finally:
           self.ready_e[idx].set()
