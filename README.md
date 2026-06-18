@@ -54,7 +54,7 @@ Call `loader.get_dummy_batch()` when you need a sanity-check batch before the sh
 
 Set `config.fill_once=True`, `config.min_mixing=1`, and `config.num_readers=1` to populate the shuffle buffer once, then yield one ordered pass over it without returning indices to the writers. Reader waits for the full `shuffle_size` before yielding batches in this mode.
 
-By default (`config.evict_on_read=True`) a slot is returned to the writers as soon as it is read, so each sample is consumed once. Set `config.evict_on_read=False` to keep read slots in the buffer. In this mode the loader yields `(batch, indices)`. The client can manually evict slots by calling `loader.evict(indices)`. Never evicting will freeze the buffer once it fills, and evicting faster than writers can refill will make reads wait.
+By default (`config.evict_on_read=True`) a buffer index is returned to the writers as soon as it is read, so each sample is consumed once. Set `config.evict_on_read=False` to keep read entries in the buffer for re-sampling and have the client manage eviction with `loader.evict(indices)`. Never evicting will freeze the buffer once it fills, and evicting faster than writers can refill will make reads wait. Every batch carries the buffer index of each row in `batch[0][INDEX_KEY]` (a `(bs,)` int64 tensor). `config.evict_on_read=False` is not supported with `fill_once=True`.
 
 ## Notes
 

@@ -27,7 +27,7 @@ from gigashuffle.config import DataloaderConfig
 
 
 Buffer = list[dict[str, torch.Tensor]]
-ReaderBatch = tuple[Buffer, int, list[int]]
+INDEX_KEY = '_gigashuffle_idx'
 RANK_ID_FORMAT = 'global_rank_{global_rank}'
 CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
@@ -272,6 +272,7 @@ def create_shared_shuffle_buffer_attachment(first_samples: Buffer, shuffle_size:
       tensor[:] = tmp
       b[k] = tensor
     dummy_batch.append(b)
+  dummy_batch[0][INDEX_KEY] = torch.full((dummy_bs,), -1, dtype=torch.int64).share_memory_()
 
   return ShuffleBufferAttachment(metadata=metadata, shuffle_buffer=shuffle_buffer, dummy_batch=dummy_batch)
 
@@ -467,6 +468,7 @@ def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) 
     dtype = getattr(torch, t['dtype'])
     shape = tuple([config.bs] + list(t['shape'][1:]))
     reader_buffer[t['i']][t['k']] = torch.empty(shape, dtype=dtype).share_memory_()
+  reader_buffer[0][INDEX_KEY] = torch.empty(config.bs, dtype=torch.int64).share_memory_()
   return r, attachment.shuffle_buffer, reader_buffer
 
 
@@ -476,29 +478,29 @@ def copy_to_reader_buffer(reader_buffer: Buffer, shuffle_buffer: Buffer, idx_lis
       reader_buffer[buffer_idx][k][:] = shuffle_buffer[buffer_idx][k][idx_list]
 
 
-def send_reader_buffer(ready_q: SimpleQueue[ReaderBatch], ready_e: Event, reader_buffer: Buffer, proc_idx: int, idx_list: list[int]) -> None:
-  ready_q.put((reader_buffer, proc_idx, idx_list))
+def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, reader_buffer: Buffer, proc_idx: int) -> None:
+  ready_q.put((reader_buffer, proc_idx))
   while not ready_e.is_set():
     ready_e.wait()
   ready_e.clear()
 
 
-def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[ReaderBatch], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
+def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
   assert request_batch_q is None
   set_parent_death_signal(parent_pid)
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
   min_mixing_n = int(config.min_mixing * config.shuffle_size)
-  full_key, empty_key = f'{queue_name}-full', f'{queue_name}-empty'
-  return_key = empty_key if config.evict_on_read else full_key
+  return_key = f'{queue_name}-empty' if config.evict_on_read else f'{queue_name}-full'
 
   for batch_idx in count():
-    idx_list = fetch_rand_from_queue(r, full_key, config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
+    idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
+    reader_buffer[0][INDEX_KEY].copy_(torch.as_tensor(idx_list))
     r.sadd(return_key, *idx_list)
-    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx, idx_list)
+    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
-def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[ReaderBatch], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
+def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
   assert request_batch_q is not None
   set_parent_death_signal(parent_pid)
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
@@ -524,7 +526,8 @@ def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[ReaderBatch]
     start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs
     idx_list = list(range(start_idx, start_idx + config.bs))
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx, idx_list)
+    reader_buffer[0][INDEX_KEY].copy_(torch.as_tensor(idx_list))
+    send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
 class MultiprocessShuffledDataloader(IterableDataset):
@@ -554,7 +557,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self._r.delete(f'{self.queue_name}-training-context-{self._rank_id}')
 
     ctx = mp.get_context('spawn')
-    self.ready_q: SimpleQueue[ReaderBatch] = ctx.SimpleQueue()
+    self.ready_q: SimpleQueue[tuple[Buffer, int]] = ctx.SimpleQueue()
     self.ready_e = [ctx.Event() for _ in range(self.config.num_readers)]
     self.request_batch_q: SimpleQueue[int] | None = ctx.SimpleQueue() if config.fill_once else None
     self.children = []
@@ -664,7 +667,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     except Exception:
       pass
 
-  def __iter__(self) -> Iterator[Buffer | tuple[Buffer, list[int]]]:
+  def __iter__(self) -> Iterator[Buffer]:
     yielded = 0
     if self.config.fill_once:
       max_iters = cast(int, self.max_iters)
@@ -677,15 +680,13 @@ class MultiprocessShuffledDataloader(IterableDataset):
         self.check_children()
 
       if not self.ready_q.empty():
-        buf, idx, idx_list = self.ready_q.get()
+        buf, idx = self.ready_q.get()
       else:
         time.sleep(0.001)
         continue
 
-      batch = buf if self.config.evict_on_read else (buf, idx_list)
-
       if self.config.fill_once:
-        yield batch
+        yield buf
         self.ready_e[idx].set()
         yielded += 1
         if yielded >= max_iters:
@@ -693,6 +694,6 @@ class MultiprocessShuffledDataloader(IterableDataset):
         self.request_batch_q.put(yielded)
       else:
         try:
-          yield batch
+          yield buf
         finally:
           self.ready_e[idx].set()
