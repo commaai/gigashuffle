@@ -10,6 +10,7 @@ class DataloaderConfig:
   num_readers: int = 2
   writer_max_retries: int = 100
   fill_once: bool = False
+  evict_on_read: bool = True
   local_rank: int = 0
   global_rank: int = 0
   local_world_size: int = 1

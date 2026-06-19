@@ -27,6 +27,7 @@ from gigashuffle.config import DataloaderConfig
 
 
 Buffer = list[dict[str, torch.Tensor]]
+INDEX_KEY = '_gigashuffle_idx'
 RANK_ID_FORMAT = 'global_rank_{global_rank}'
 CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
@@ -271,6 +272,7 @@ def create_shared_shuffle_buffer_attachment(first_samples: Buffer, shuffle_size:
       tensor[:] = tmp
       b[k] = tensor
     dummy_batch.append(b)
+  dummy_batch[0][INDEX_KEY] = torch.full((dummy_bs,), -1, dtype=torch.int64).share_memory_()
 
   return ShuffleBufferAttachment(metadata=metadata, shuffle_buffer=shuffle_buffer, dummy_batch=dummy_batch)
 
@@ -466,6 +468,7 @@ def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) 
     dtype = getattr(torch, t['dtype'])
     shape = tuple([config.bs] + list(t['shape'][1:]))
     reader_buffer[t['i']][t['k']] = torch.empty(shape, dtype=dtype).share_memory_()
+  reader_buffer[0][INDEX_KEY] = torch.empty(config.bs, dtype=torch.int64).share_memory_()
   return r, attachment.shuffle_buffer, reader_buffer
 
 
@@ -473,6 +476,7 @@ def copy_to_reader_buffer(reader_buffer: Buffer, shuffle_buffer: Buffer, idx_lis
   for buffer_idx in range(len(shuffle_buffer)):
     for k in shuffle_buffer[buffer_idx].keys():
       reader_buffer[buffer_idx][k][:] = shuffle_buffer[buffer_idx][k][idx_list]
+  reader_buffer[0][INDEX_KEY].copy_(torch.as_tensor(idx_list))
 
 
 def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, reader_buffer: Buffer, proc_idx: int) -> None:
@@ -487,11 +491,12 @@ def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
   set_parent_death_signal(parent_pid)
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
   min_mixing_n = int(config.min_mixing * config.shuffle_size)
+  return_key = f'{queue_name}-empty' if config.evict_on_read else f'{queue_name}-full'
 
   for batch_idx in count():
     idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    r.sadd(f'{queue_name}-empty', *idx_list)
+    r.sadd(return_key, *idx_list)
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
@@ -531,6 +536,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self.config = config
     assert config.num_writers > 0, "gigashuffle requires num_writers > 0"
     assert config.queue_name, "MultiprocessShuffledDataloader requires config.queue_name"
+    assert not (config.fill_once and not config.evict_on_read), "evict_on_read=False is not supported with fill_once"
     if config.fill_once:
       assert config.num_readers == 1, "fill_once requires num_readers == 1"
       assert config.min_mixing == 1, "fill_once requires min_mixing == 1"
@@ -606,6 +612,19 @@ class MultiprocessShuffledDataloader(IterableDataset):
       )
     in_flight = self.config.shuffle_size - full - empty
     return ShuffleBufferStats(full=full, empty=empty, in_flight=in_flight)
+
+  def evict(self, indices: list[int]) -> int:
+    assert not self.config.evict_on_read, "evict() requires evict_on_read=False"
+    if not (indices := [int(i) for i in indices]):
+      return 0
+    full_key, empty_key = f'{self.queue_name}-full', f'{self.queue_name}-empty'
+    with self._r.pipeline(transaction=False) as pipe:
+      for idx in indices:
+        pipe.srem(full_key, idx)
+      removed = pipe.execute()
+    if freed := [idx for idx, ok in zip(indices, removed) if ok]:
+      self._r.sadd(empty_key, *freed)
+    return len(freed)
 
   def check_children(self) -> None:
     for i, p in enumerate(self.children):
