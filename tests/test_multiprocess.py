@@ -12,7 +12,7 @@ import torch
 from redis import StrictRedis
 from torch.utils.data import IterableDataset, get_worker_info
 
-from gigashuffle import DataloaderConfig, MultiprocessShuffledDataloader, ShuffleBufferStats
+from gigashuffle import DataloaderConfig, INDEX_KEY, MultiprocessShuffledDataloader, ShuffleBufferStats
 from gigashuffle.multiprocess import BatchSizeMismatch, fetch_initial_sample, get_samples, write_samples_to_buffer
 
 
@@ -123,6 +123,31 @@ def test_dummy_batch_returns_before_min_mixing():
     assert int(r.scard(f'gigashuffle-{queue_name}-full')) < 32
     assert batch[0]['worker_id'].eq(0).all()
   finally:
+    loader._shutdown_workers()
+
+
+def test_evict_on_read_false_keeps_indices_until_explicit_evict():
+  r = StrictRedis(**REDIS)
+  queue_name = f'manual-evict-{uuid.uuid4().hex}'
+  # sleep 10 to prevent racing
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=10.0), config(queue_name, shuffle_size=12, num_writers=1, num_readers=1, evict_on_read=False))
+  it = iter(loader)
+  try:
+    batch = next(it)
+    indices = batch[0][INDEX_KEY].tolist()
+    assert len(indices) == 4
+    assert len(set(indices)) == 4
+
+    full_key = f'gigashuffle-{queue_name}-full'
+    empty_key = f'gigashuffle-{queue_name}-empty'
+    assert set(indices) <= {int(x) for x in r.smembers(full_key)}
+    empty_before = {int(x) for x in r.smembers(empty_key)}
+    assert loader.evict(indices) == 4
+    empty_after = {int(x) for x in r.smembers(empty_key)}
+    assert set(indices).isdisjoint({int(x) for x in r.smembers(full_key)})
+    assert empty_after == empty_before | set(indices)
+  finally:
+    del it
     loader._shutdown_workers()
 
 

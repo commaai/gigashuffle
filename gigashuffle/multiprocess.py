@@ -476,6 +476,7 @@ def copy_to_reader_buffer(reader_buffer: Buffer, shuffle_buffer: Buffer, idx_lis
   for buffer_idx in range(len(shuffle_buffer)):
     for k in shuffle_buffer[buffer_idx].keys():
       reader_buffer[buffer_idx][k][:] = shuffle_buffer[buffer_idx][k][idx_list]
+  reader_buffer[0][INDEX_KEY].copy_(torch.as_tensor(idx_list))
 
 
 def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, reader_buffer: Buffer, proc_idx: int) -> None:
@@ -495,7 +496,6 @@ def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
   for batch_idx in count():
     idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    reader_buffer[0][INDEX_KEY].copy_(torch.as_tensor(idx_list))
     r.sadd(return_key, *idx_list)
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
@@ -526,7 +526,6 @@ def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
     start_idx = (batch_idx * config.local_world_size + config.local_rank) * config.bs
     idx_list = list(range(start_idx, start_idx + config.bs))
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    reader_buffer[0][INDEX_KEY].copy_(torch.as_tensor(idx_list))
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
