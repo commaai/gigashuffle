@@ -136,6 +136,8 @@ def numpy_type_to_torch(x):
     return torch.int32
   elif x == np.float32 or x == torch.float32:
     return torch.float32
+  elif x == np.float16 or x == torch.float16:
+    return torch.float16
   else:
     raise Exception(f"unsupported numpy type {x!r}")
 
