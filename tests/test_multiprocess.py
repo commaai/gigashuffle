@@ -185,6 +185,17 @@ def test_init_does_not_wait_for_metadata():
     loader._shutdown_workers()
 
 
+def test_fill_once_iter_does_not_wait_for_full_buffer():
+  queue_name = f'lazy-fill-once-iter-{uuid.uuid4().hex}'
+  loader = MultiprocessShuffledDataloader(SlowFirstSampleDataset(sleep=5.0), config(queue_name, shuffle_size=12, min_mixing=1, fill_once=True, num_writers=1, num_readers=1))
+  try:
+    start = time.perf_counter()
+    iter(loader)
+    assert time.perf_counter() - start < 2.0
+  finally:
+    loader._shutdown_workers()
+
+
 def test_batch_size_mismatch():
   samples = iter([[{'x': torch.arange(2), 'y': torch.arange(3)}]])
   with pytest.raises(BatchSizeMismatch):
@@ -253,7 +264,8 @@ def test_fill_once_loops_in_order():
     with pytest.raises(StopIteration):
       next(it)
     assert int(r.scard(f'gigashuffle-{queue_name}-empty')) == 0
-    writer = loader.children[1]
+    assert len(loader.children) == 1
+    writer = loader.children[0]
     assert writer.is_alive()
     assert loader.get_dummy_batch()[0]['x'].tolist() == [0, 1, 2, 3]
     loader.check_children()
@@ -281,6 +293,49 @@ def test_fill_once_iters_repeat_underconsumed():
     ll = iter(loader)
     second = [next(ll)[0]['x'].tolist() for _ in range(3)]
     assert first == second
+  finally:
+    loader._shutdown_workers()
+
+
+def test_fill_once_getitem_reads_absolute_buffer_index():
+  queue_name = f'fill-once-getitem-{uuid.uuid4().hex}'
+  loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1, num_writers=1))
+  try:
+    first_item = loader[0]
+    assert first_item[0]['x'].shape == torch.Size([])
+    assert first_item[0]['x'].item() == 0
+    assert first_item[0][INDEX_KEY].shape == torch.Size([])
+    assert first_item[0][INDEX_KEY].item() == 0
+
+    by_idx = {}
+    for batch in loader:
+      xs = batch[0]['x'].clone()
+      idxs = batch[0][INDEX_KEY].clone()
+      for idx, x in zip(idxs.tolist(), xs):
+        by_idx[idx] = x.clone()
+
+    assert set(by_idx) == set(range(12))
+    for idx in [0, 5, 11]:
+      item = loader[idx]
+      assert item[0]['x'].shape == torch.Size([])
+      assert torch.equal(item[0]['x'], by_idx[idx])
+      assert item[0][INDEX_KEY].shape == torch.Size([])
+      assert item[0][INDEX_KEY].item() == idx
+
+    with pytest.raises(IndexError):
+      loader[-1]
+    with pytest.raises(IndexError):
+      loader[12]
+  finally:
+    loader._shutdown_workers()
+
+
+def test_getitem_requires_fill_once():
+  queue_name = f'getitem-streaming-{uuid.uuid4().hex}'
+  loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name, num_writers=1, num_readers=1))
+  try:
+    with pytest.raises(RuntimeError, match='fill_once=True'):
+      loader[0]
   finally:
     loader._shutdown_workers()
 
