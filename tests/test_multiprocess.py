@@ -1,5 +1,6 @@
 import os
 import pickle
+import signal
 import subprocess
 import sys
 import time
@@ -56,6 +57,21 @@ class VariableBatchDataset(IterableDataset):
       n = sizes[i % len(sizes)]
       yield [{'x': torch.arange(n), 'y': torch.full((n,), n)}]
       i += 1
+
+
+class FiniteDataset(IterableDataset):
+  def __init__(self, n: int, input_bs: int = 4) -> None:
+    self.n = n
+    self.input_bs = input_bs
+
+  def __iter__(self):
+    worker_info = get_worker_info()
+    worker_id = 0 if worker_info is None else worker_info.id
+    num_workers = 1 if worker_info is None else worker_info.num_workers
+    ids = list(range(worker_id, self.n, num_workers))
+    for start in range(0, len(ids), self.input_bs):
+      chunk = torch.tensor(ids[start:start + self.input_bs])
+      yield [{'id': chunk, 'x': torch.ones(len(chunk), 2)}]
 
 
 class OrderedDataset(IterableDataset):
@@ -347,6 +363,27 @@ def test_cuda_work_inside_worker():
     batch = loader.get_dummy_batch()
     assert batch[0]['x'].tolist() == [0, 2, 4, 6]
   finally:
+    loader._shutdown_workers()
+
+
+def test_streaming_finite_dataset_drains_and_ends():
+  queue_name = f'finite-{uuid.uuid4().hex}'
+  n = 128
+  loader = MultiprocessShuffledDataloader(FiniteDataset(n), config(queue_name, shuffle_size=32, min_mixing=0.5, num_writers=2, num_readers=1))
+
+  def on_timeout(signum, frame):
+    raise TimeoutError("finite loader did not stop")
+
+  old_handler = signal.signal(signal.SIGALRM, on_timeout)
+  signal.alarm(60)
+  try:
+    batches = [batch[0]['id'].tolist() for batch in loader]
+    assert len(batches) == n // 4
+    assert sorted(x for batch in batches for x in batch) == list(range(n))
+    loader.check_children()
+  finally:
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, old_handler)
     loader._shutdown_workers()
 
 

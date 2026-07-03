@@ -14,7 +14,7 @@ from itertools import batched, count
 from multiprocessing.connection import AuthenticationError, Client, Listener
 from multiprocessing.synchronize import Event
 from multiprocessing.queues import SimpleQueue
-from typing import Any, Iterator, cast
+from typing import Any, Callable, Iterator, cast
 
 import torch
 import numpy as np
@@ -203,11 +203,12 @@ def initialize_redis_queue(r: StrictRedis, queue_name: str, shuffle_size: int) -
   r.delete(f"{queue_name}-initializing")
   r.delete(f"{queue_name}-empty")
   r.delete(f"{queue_name}-full")
+  r.delete(f"{queue_name}-writers-done")
   for idxs in batched(range(0, shuffle_size), n=CHUNK_SIZE):
     r.sadd(f'{queue_name}-empty', *idxs)
 
 
-def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixing_n: int | None = None, log_progress: bool = False) -> list[int]:
+def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixing_n: int | None = None, log_progress: bool = False, stop_waiting: Callable[[], bool] | None = None) -> list[int]:
   idx_list: list[int] = []
   if min_mixing_n is not None:
     last_log_time = 0.
@@ -215,6 +216,8 @@ def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixin
     scard = cast(int, r.scard(queue_name))
     wait_start_scard = scard
     while scard < min_mixing_n:
+      if stop_waiting is not None and stop_waiting():
+        break
       now = time.perf_counter()
       if log_progress and now - last_log_time >= LOG_INTERVAL_S:
         elapsed_s, eta_s = get_elapsed_and_eta(now, wait_start_time, scard, wait_start_scard, min_mixing_n)
@@ -222,11 +225,12 @@ def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixin
         last_log_time = now
       time.sleep(0.1)
       scard = cast(int, r.scard(queue_name))
-    if log_progress:
+    if log_progress and scard >= min_mixing_n:
       logger.info(f"{queue_name} reached {min_mixing_n}")
   while True:
+    stop = stop_waiting is not None and stop_waiting()
     idx_list.extend(int(x) for x in cast(list[bytes], r.spop(queue_name, count - len(idx_list))))
-    if len(idx_list) >= count:
+    if len(idx_list) >= count or stop:
       break
     time.sleep(0.1)
   return idx_list
@@ -409,13 +413,18 @@ def write_samples_to_buffer(shuffle_buffer: Buffer, samples: Buffer, idx_list: l
 def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
   r, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  owns_attach_server = config.local_rank * config.num_writers + proc_idx == 0
   empty_key = f'{queue_name}-empty'
   rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
   while True:
     training_context = cast(bytes | None, r.get(f'{queue_name}-training-context-{rank_id}'))
     if training_context is not None:
       dset.context = pickle.loads(training_context)
-    samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
+    try:
+      samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
+    except StopIteration:
+      r.incr(f'{queue_name}-writers-done')
+      exit_or_keep_attach_server_alive(owns_attach_server)
     max_input_bs = (config.shuffle_size - config.bs) // (config.local_world_size * config.num_writers)
     if local_input_bs > max_input_bs:
       local_input_bs = max_input_bs
@@ -492,9 +501,18 @@ def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer
   r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
   min_mixing_n = int(config.min_mixing * config.shuffle_size)
   return_key = f'{queue_name}-empty' if config.evict_on_read else f'{queue_name}-full'
+  full_key = f'{queue_name}-full'
+  expected_writers = config.local_world_size * config.num_writers
+
+  def writers_done() -> bool:
+    return int(cast(bytes | None, r.get(f'{queue_name}-writers-done')) or 0) >= expected_writers
 
   for batch_idx in count():
-    idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
+    idx_list = fetch_rand_from_queue(r, full_key, config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0, stop_waiting=writers_done)
+    if len(idx_list) < config.bs:
+      if idx_list:
+        r.sadd(full_key, *idx_list)
+      raise SystemExit(FILL_ONCE_WRITER_DONE_EXITCODE)
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
     r.sadd(return_key, *idx_list)
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
@@ -629,7 +647,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
   def check_children(self) -> None:
     for i, p in enumerate(self.children):
       if not p.is_alive():
-        if self.config.fill_once and i >= self.config.num_readers and p.exitcode == FILL_ONCE_WRITER_DONE_EXITCODE:
+        if p.exitcode == FILL_ONCE_WRITER_DONE_EXITCODE:
           continue
         raise RuntimeError(f"MultiprocessShuffledDataloader child {p.name} (pid={p.pid}) died (exitcode={p.exitcode}). Aborting.")
     self.check_child_time = time.perf_counter()
@@ -681,6 +699,9 @@ class MultiprocessShuffledDataloader(IterableDataset):
       if not self.ready_q.empty():
         buf, idx = self.ready_q.get()
       else:
+        readers = self.children[:self.config.num_readers]
+        if not self.config.fill_once and readers and all(not p.is_alive() and p.exitcode == FILL_ONCE_WRITER_DONE_EXITCODE for p in readers):
+          return
         time.sleep(0.001)
         continue
 
