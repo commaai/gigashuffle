@@ -27,6 +27,7 @@ Buffer = list[dict[str, torch.Tensor]]
 INDEX_KEY = '_gigashuffle_idx'
 RANK_ID_FORMAT = 'global_rank_{global_rank}'
 LOG_INTERVAL_S = 5.0
+COORDINATOR_WAIT_LOG_INTERVAL_S = 30.0
 PR_SET_PDEATHSIG = 1
 FILL_ONCE_WRITER_DONE_EXITCODE = 81
 CLOSE_JOIN_TIMEOUT_S = 0.2
@@ -217,9 +218,9 @@ def fetch_rand_from_queue(coord: CoordinatorClient, which: str, count: int, min_
 
 
 def wait_for_shuffle_buffer_attach_count(coord: CoordinatorClient, queue_name: str, expected_count: int) -> None:
-  last_log_time = 0.
+  last_log_time = time.perf_counter()
   while (attached_count := coord.attached_count()) < expected_count:
-    if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
+    if time.perf_counter() - last_log_time >= COORDINATOR_WAIT_LOG_INTERVAL_S:
       logger.info(f"waiting for {queue_name} attached processes - {attached_count} / {expected_count}")
       last_log_time = time.perf_counter()
     time.sleep(0.1)
@@ -267,7 +268,7 @@ def start_coordinator(queue_name: str, attachment: ShuffleBufferAttachment, empt
 def attach_to_shared_shuffle_buffer(queue_name: str, count_attach: bool = True, check_children: Any | None = None) -> ShuffleBufferAttachment:
   initialize_shuffle_buffer_tensor_ipc()
   coord = CoordinatorClient(queue_name)
-  last_log_time = 0.
+  last_log_time = time.perf_counter()
 
   while True:
     try:
@@ -275,7 +276,7 @@ def attach_to_shared_shuffle_buffer(queue_name: str, count_attach: bool = True, 
     except COORDINATOR_CONNECT_ERRORS as e:
       if check_children is not None:
         check_children()
-      if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
+      if time.perf_counter() - last_log_time >= COORDINATOR_WAIT_LOG_INTERVAL_S:
         logger.info(f"waiting for gigashuffle coordinator for {queue_name}: {e}")
         last_log_time = time.perf_counter()
       time.sleep(0.05)
