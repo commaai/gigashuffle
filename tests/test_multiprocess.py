@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 import torch
-from redis import StrictRedis
 from torch.utils.data import IterableDataset, get_worker_info
 
 from gigashuffle import DataloaderConfig, INDEX_KEY, MultiprocessShuffledDataloader, ShuffleBufferStats
 from gigashuffle.multiprocess import BatchSizeMismatch, fetch_initial_sample, get_samples, write_samples_to_buffer
+from gigashuffle.redis_client import make_redis_client
 
 
 REDIS = dict(host=os.environ.get('REDIS_HOST', 'localhost'), port=int(os.environ.get('REDIS_PORT', '6379')), db=int(os.environ.get('REDIS_DB', '6')))
@@ -31,7 +31,7 @@ class RedisDataset(IterableDataset):
     self.x_offset = x_offset
 
   def __iter__(self):
-    r = StrictRedis(**REDIS)
+    r = make_redis_client(**REDIS)
     worker_info = get_worker_info()
     worker_id = -1 if worker_info is None else worker_info.id
     num_workers = 1 if worker_info is None else worker_info.num_workers
@@ -115,7 +115,7 @@ def test_torchrun_gloo():
 
 
 def test_dummy_batch_returns_before_min_mixing():
-  r = StrictRedis(**REDIS)
+  r = make_redis_client(**REDIS)
   queue_name = f'dummy-{uuid.uuid4().hex}'
   loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, shuffle_size=64, min_mixing=0.5))
   try:
@@ -127,7 +127,7 @@ def test_dummy_batch_returns_before_min_mixing():
 
 
 def test_evict_on_read_false_keeps_indices_until_explicit_evict():
-  r = StrictRedis(**REDIS)
+  r = make_redis_client(**REDIS)
   queue_name = f'manual-evict-{uuid.uuid4().hex}'
   # sleep 10 to prevent racing
   loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=10.0), config(queue_name, shuffle_size=12, num_writers=1, num_readers=1, evict_on_read=False))
@@ -162,7 +162,7 @@ def test_get_dummy_batch_aborts_when_writer_dies_before_attach_server():
 
 
 def test_stats_report_buffer_counts():
-  r = StrictRedis(**REDIS)
+  r = make_redis_client(**REDIS)
   queue_name = f'stats-{uuid.uuid4().hex}'
   loader = MultiprocessShuffledDataloader(RedisDataset(queue_name, sleep=1.0), config(queue_name, shuffle_size=64, min_mixing=0.5))
   try:
@@ -248,7 +248,7 @@ def test_write_samples_slices_to_acquired_slots():
 
 
 def test_fill_once_loops_in_order():
-  r = StrictRedis(**REDIS)
+  r = make_redis_client(**REDIS)
   queue_name = f'fill-once-{uuid.uuid4().hex}'
   loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1, num_writers=1))
   try:
@@ -361,7 +361,7 @@ def test_multiple_loaders_fill_together():
 
 
 def test_worker_info_and_iter_once():
-  r = StrictRedis(**REDIS)
+  r = make_redis_client(**REDIS)
   queue_name = f'workers-{uuid.uuid4().hex}'
   loader = MultiprocessShuffledDataloader(RedisDataset(queue_name), config(queue_name, num_writers=2))
   try:
@@ -376,7 +376,7 @@ def test_worker_info_and_iter_once():
 
 
 def test_attach_training_context_updates_writer_dataset_epoch():
-  r = StrictRedis(**REDIS)
+  r = make_redis_client(**REDIS)
   queue_name = f'context-{uuid.uuid4().hex}'
   context = TrainingContext(epoch=7, step=3, device=torch.device('cpu'))
   r.set(f'gigashuffle-{queue_name}-training-context-global_rank_0', pickle.dumps(context))

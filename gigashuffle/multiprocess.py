@@ -24,6 +24,7 @@ from setproctitle import setproctitle
 from torch.utils.data import Dataset, IterableDataset
 from gigashuffle.worker_info import set_worker_info
 from gigashuffle.config import DataloaderConfig
+from gigashuffle.redis_client import make_redis_client
 
 
 Buffer = list[dict[str, torch.Tensor]]
@@ -282,7 +283,7 @@ def start_shuffle_buffer_attach_server(config: DataloaderConfig, queue_name: str
   h = hashlib.sha1(f'gigashuffle:{os.getuid()}:{queue_name}'.encode()).hexdigest()[:24]
   sock_path = f'/tmp/gigashuffle-{os.getuid()}-{h}.sock'
   attach_key = f'{queue_name}-shared-buffer-attach-socket'
-  r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
 
   try:
     os.unlink(sock_path)
@@ -321,7 +322,7 @@ def start_shuffle_buffer_attach_server(config: DataloaderConfig, queue_name: str
 def attach_to_shared_shuffle_buffer(config: DataloaderConfig, queue_name: str) -> ShuffleBufferAttachment:
   authkey = initialize_shuffle_buffer_tensor_ipc()
   attach_key = f'{queue_name}-shared-buffer-attach-socket'
-  r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
   last_log_time = 0.
   last_error: BaseException | None = None
 
@@ -368,7 +369,7 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   np.random.seed(global_proc_idx)
   set_worker_info(dset, worker_id=global_proc_idx, num_workers=total_procs, seed=global_proc_idx)
 
-  r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
   dset_iter = iter(dset) if hasattr(dset, '__iter__') else dset
   if local_proc_idx == 0:
     initialize_redis_queue(r, queue_name, shuffle_size)
@@ -460,7 +461,7 @@ def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) 
   init_logger()
   initialize_shuffle_buffer_tensor_ipc()
   setproctitle(f'gigashuffle reader {queue_name} local_rank={config.local_rank} proc={proc_idx}')
-  r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
   attachment = attach_to_shared_shuffle_buffer(config, queue_name)
   r.incr(f'{queue_name}-shared-buffer-attached')
   reader_buffer: Buffer = [{} for _ in range(max(t['i'] for t in attachment.metadata['fields']) + 1)]
@@ -519,7 +520,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self._rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
     self._shutdown = False
 
-    self._r = StrictRedis(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+    self._r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
     try:
       assert self._r.ping()
     except Exception as e:
