@@ -18,10 +18,6 @@ def coordinator_socket_path(queue_name: str) -> str:
   return f'/tmp/gigashuffle-{os.getuid()}-{h}.sock'
 
 
-def coordinator_socket_glob() -> str:
-  return f'/tmp/gigashuffle-{os.getuid()}-*.sock'
-
-
 class CoordinatorServer:
   def __init__(self, queue_name: str, attachment: Any, empty_indices: list[int]) -> None:
     self.queue_name = queue_name
