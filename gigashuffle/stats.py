@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import pickle
 
-from redis import StrictRedis
+from gigashuffle.redis_client import make_redis_client
 
 
 def print_stats(host="localhost", port=6379, db=6):
-  r = StrictRedis(host=host, port=port, db=db)
+  r = make_redis_client(host=host, port=port, db=db)
   queues = set()
 
   for raw_key in r.scan_iter("gigashuffle-*-shared-buffer-meta"):
