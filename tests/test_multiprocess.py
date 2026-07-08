@@ -14,6 +14,8 @@ import gigashuffle.stats as stats_cli
 from gigashuffle import DataloaderConfig, INDEX_KEY, MultiprocessShuffledDataloader, ShuffleBufferStats
 from gigashuffle.multiprocess import (
   BatchSizeMismatch,
+  EMPTY_SAMPLE_BACKOFF_WINDOW_S,
+  EMPTY_SAMPLE_RETRY_SLEEP_S,
   fetch_initial_sample,
   get_samples,
   write_samples_to_buffer,
@@ -217,11 +219,29 @@ def test_batch_size_mismatch():
     get_samples(samples)
 
 
-def test_writer_max_retries():
-  writer_max_retries = 3
-  samples = iter([[{'x': torch.empty(0)}] for _ in range(writer_max_retries)] + [[{'x': torch.arange(1)}]])
-  with pytest.raises(ValueError, match=str(writer_max_retries)):
-    fetch_initial_sample(samples, config(f'retries-{uuid.uuid4().hex}', writer_max_retries=writer_max_retries))
+def test_writer_max_retries_then_backoff_recovers(monkeypatch):
+  sleeps = []
+
+  monkeypatch.setattr(time, 'sleep', sleeps.append)
+
+  samples = iter([[{'x': torch.empty(0)}] for _ in range(7)] + [[{'x': torch.arange(1)}]])
+
+  input_samples, input_bs, _ = fetch_initial_sample(samples, config(f'retries-{uuid.uuid4().hex}', writer_max_retries=3))
+
+  assert input_bs == 1
+  assert input_samples[0]['x'].tolist() == [0]
+  assert sleeps == [EMPTY_SAMPLE_RETRY_SLEEP_S] * 5
+
+
+def test_writer_max_retries_then_backoff_fails(monkeypatch):
+  sleeps = []
+  monkeypatch.setattr(time, 'sleep', sleeps.append)
+
+  samples = iter([[{'x': torch.empty(0)}] for _ in range(1000)])
+
+  with pytest.raises(ValueError, match="3 fast attempts and 10s of backoff"):
+    fetch_initial_sample(samples, config(f'retries-fail-{uuid.uuid4().hex}', writer_max_retries=3))
+  assert sleeps == [EMPTY_SAMPLE_RETRY_SLEEP_S] * int(EMPTY_SAMPLE_BACKOFF_WINDOW_S / EMPTY_SAMPLE_RETRY_SLEEP_S)
 
 
 def test_loader_forces_fd_sharing_without_visible_torch_files():

@@ -28,6 +28,8 @@ INDEX_KEY = '_gigashuffle_idx'
 RANK_ID_FORMAT = 'global_rank_{global_rank}'
 LOG_INTERVAL_S = 5.0
 COORDINATOR_WAIT_LOG_INTERVAL_S = 30.0
+EMPTY_SAMPLE_RETRY_SLEEP_S = 0.5
+EMPTY_SAMPLE_BACKOFF_WINDOW_S = 10.0
 PR_SET_PDEATHSIG = 1
 FILL_ONCE_WRITER_DONE_EXITCODE = 81
 CLOSE_JOIN_TIMEOUT_S = 0.2
@@ -153,15 +155,19 @@ def assert_bs_equal(samples, input_bs=None):
 
 
 def get_samples(dset, input_bs_key=None, max_retries=100):
-  for i in range(max_retries):
+  sleep_schedule = [0.0] * max_retries + [EMPTY_SAMPLE_RETRY_SLEEP_S] * int(EMPTY_SAMPLE_BACKOFF_WINDOW_S / EMPTY_SAMPLE_RETRY_SLEEP_S)
+  for sleep_s in sleep_schedule:
+    if sleep_s:
+      time.sleep(sleep_s)
     samples = next(dset) if hasattr(dset, '__next__') else random.choice(dset)
     if input_bs_key is None:
       input_bs_key = get_input_bs_key(samples)
     input_bs = samples[input_bs_key[0]][input_bs_key[1]].shape[0]
-    if input_bs > 0:
-      assert_bs_equal(samples, input_bs)
-      return samples, input_bs, input_bs_key
-  raise ValueError(f"dataset returned only empty samples in {max_retries} attempts")
+    if input_bs <= 0:
+      continue
+    assert_bs_equal(samples, input_bs)
+    return samples, input_bs, input_bs_key
+  raise ValueError(f"dataset returned only empty samples in {max_retries} fast attempts and {EMPTY_SAMPLE_BACKOFF_WINDOW_S:g}s of backoff")
 
 
 def get_memory_size(first_samples, input_bs):
