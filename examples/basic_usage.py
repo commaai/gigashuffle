@@ -50,9 +50,6 @@ def main() -> None:
   local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', '1'))
   global_world_size = int(os.environ['WORLD_SIZE'])
   node_rank = os.environ.get('GROUP_RANK', os.environ.get('NODE_RANK', '0'))
-  redis_host = os.environ.get('REDIS_HOST', 'localhost')
-  redis_port = int(os.environ.get('REDIS_PORT', '6379'))
-  redis_db = int(os.environ.get('REDIS_DB', '6'))
   queue_prefix = os.environ.get('GIGASHUFFLE_QUEUE_PREFIX', f'basic-usage-node-{node_rank}')
   device = 'cpu'
 
@@ -67,9 +64,6 @@ def main() -> None:
       global_rank=global_rank,
       local_world_size=local_world_size,
       global_world_size=global_world_size,
-      redis_host=redis_host,
-      redis_port=redis_port,
-      redis_db=redis_db,
       queue_name=f'{queue_prefix}-train',
     ),
   )
@@ -84,9 +78,6 @@ def main() -> None:
       global_rank=global_rank,
       local_world_size=local_world_size,
       global_world_size=global_world_size,
-      redis_host=redis_host,
-      redis_port=redis_port,
-      redis_db=redis_db,
       queue_name=f'{queue_prefix}-val',
     ),
   )

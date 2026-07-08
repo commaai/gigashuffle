@@ -1,41 +1,30 @@
 #!/usr/bin/env python3
-import pickle
 
-from gigashuffle.redis_client import make_redis_client
+from glob import glob
 
-
-def print_stats(host="localhost", port=6379, db=6):
-  r = make_redis_client(host=host, port=port, db=db)
-  queues = set()
-
-  for raw_key in r.scan_iter("gigashuffle-*-shared-buffer-meta"):
-    key = raw_key.decode()
-    queues.add(key.removesuffix("-shared-buffer-meta"))
-
-  for raw_key in r.scan_iter("gigashuffle-*-initializing"):
-    key = raw_key.decode()
-    queues.add(key.removesuffix("-initializing"))
-
-  for queue in sorted(queues):
-    raw_meta = r.get(f"{queue}-shared-buffer-meta")
-    print(queue)
-    if raw_meta is None:
-      print("  initializing: 1")
-      continue
-
-    meta = pickle.loads(raw_meta)
-    full = r.scard(f"{queue}-full")
-    empty = r.scard(f"{queue}-empty")
-    size = meta["shuffle_size"]
-    attached = int(r.get(f"{queue}-shared-buffer-attached") or 0)
-    print(f"  full: {full}")
-    print(f"  empty: {empty}")
-    print(f"  inflight: {size-full-empty}")
-    print(f"  size: {size}")
-    print(f"  attached: {attached}")
+from gigashuffle.coordinator import COORDINATOR_CONNECT_ERRORS, CoordinatorClient, coordinator_socket_glob
 
 
-def main():
+STATS_ERRORS = COORDINATOR_CONNECT_ERRORS + (RuntimeError,)
+
+
+def live_stats() -> list[dict[str, int | str]]:
+  stats = []
+  for sock_path in sorted(glob(coordinator_socket_glob())):
+    try:
+      stats.append(CoordinatorClient.from_socket_path(sock_path).info())
+    except STATS_ERRORS:
+      pass
+  return stats
+
+
+def print_stats() -> None:
+  print("queue_name full empty in_flight attached")
+  for s in live_stats():
+    print(f"{s['queue_name']} {s['full']} {s['empty']} {s['in_flight']} {s['attached']}")
+
+
+def main() -> None:
   print_stats()
 
 

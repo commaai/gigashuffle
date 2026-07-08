@@ -1,17 +1,14 @@
 import atexit
 import ctypes
-import hashlib
 import logging
 import os
 import pickle
 import random
 import signal
 import sys
-import threading
 import time
 from dataclasses import dataclass
-from itertools import batched, count
-from multiprocessing.connection import AuthenticationError, Client, Listener
+from itertools import count
 from multiprocessing.synchronize import Event
 from multiprocessing.queues import SimpleQueue
 from typing import Any, Iterator, cast
@@ -19,18 +16,16 @@ from typing import Any, Iterator, cast
 import torch
 import numpy as np
 import torch.multiprocessing as mp
-from redis import StrictRedis
 from setproctitle import setproctitle
 from torch.utils.data import Dataset, IterableDataset
+from gigashuffle.coordinator import COORDINATOR_CONNECT_ERRORS, CoordinatorClient, CoordinatorServer, coordinator_authkey
 from gigashuffle.worker_info import set_worker_info
 from gigashuffle.config import DataloaderConfig
-from gigashuffle.redis_client import make_redis_client
 
 
 Buffer = list[dict[str, torch.Tensor]]
 INDEX_KEY = '_gigashuffle_idx'
 RANK_ID_FORMAT = 'global_rank_{global_rank}'
-CHUNK_SIZE = 1024*64
 LOG_INTERVAL_S = 5.0
 PR_SET_PDEATHSIG = 1
 FILL_ONCE_WRITER_DONE_EXITCODE = 81
@@ -93,12 +88,10 @@ def get_elapsed_and_eta(now: float, start_time: float, current: int, start_curre
   return elapsed_s, eta_s
 
 
-def initialize_shuffle_buffer_tensor_ipc() -> bytes:
+def initialize_shuffle_buffer_tensor_ipc() -> None:
   if sys.platform == 'linux':
     mp.set_sharing_strategy('file_descriptor')
-  authkey = hashlib.blake2b(f'gigashuffle:{os.getuid()}'.encode(), digest_size=32).digest()
-  mp.current_process().authkey = authkey
-  return authkey
+  mp.current_process().authkey = coordinator_authkey()
 
 
 def _prctl_pr_set_pdeathsig(signum: int) -> None:
@@ -198,49 +191,36 @@ def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, i
   return input_samples, input_bs, input_bs_key
 
 
-def initialize_redis_queue(r: StrictRedis, queue_name: str, shuffle_size: int) -> None:
-  logger.info(f"setting up {queue_name} on redis version {r.execute_command('INFO')['redis_version']}")
-  r.delete(f"{queue_name}-shared-buffer-meta")
-  r.delete(f"{queue_name}-shared-buffer-attached")
-  r.delete(f"{queue_name}-shared-buffer-attach-socket")
-  r.delete(f"{queue_name}-initializing")
-  r.delete(f"{queue_name}-empty")
-  r.delete(f"{queue_name}-full")
-  for idxs in batched(range(0, shuffle_size), n=CHUNK_SIZE):
-    r.sadd(f'{queue_name}-empty', *idxs)
-
-
-def fetch_rand_from_queue(r: StrictRedis, queue_name: str, count: int, min_mixing_n: int | None = None, log_progress: bool = False) -> list[int]:
+def fetch_rand_from_queue(coord: CoordinatorClient, which: str, count: int, min_mixing_n: int | None = None, log_progress: bool = False) -> list[int]:
   idx_list: list[int] = []
   if min_mixing_n is not None:
     last_log_time = 0.
     wait_start_time = time.perf_counter()
-    scard = cast(int, r.scard(queue_name))
+    scard = coord.count(which)
     wait_start_scard = scard
     while scard < min_mixing_n:
       now = time.perf_counter()
       if log_progress and now - last_log_time >= LOG_INTERVAL_S:
         elapsed_s, eta_s = get_elapsed_and_eta(now, wait_start_time, scard, wait_start_scard, min_mixing_n)
-        logger.info(f"waiting for {queue_name} - {scard} / {min_mixing_n} ({elapsed_s:.0f}s/{eta_s:.0f}s)")
+        logger.info(f"waiting for {which} - {scard} / {min_mixing_n} ({elapsed_s:.0f}s/{eta_s:.0f}s)")
         last_log_time = now
       time.sleep(0.1)
-      scard = cast(int, r.scard(queue_name))
+      scard = coord.count(which)
     if log_progress:
-      logger.info(f"{queue_name} reached {min_mixing_n}")
+      logger.info(f"{which} reached {min_mixing_n}")
   while True:
-    idx_list.extend(int(x) for x in cast(list[bytes], r.spop(queue_name, count - len(idx_list))))
+    idx_list.extend(coord.pop(which, count - len(idx_list)))
     if len(idx_list) >= count:
       break
     time.sleep(0.1)
   return idx_list
 
 
-def wait_for_shuffle_buffer_attach_count(r: StrictRedis, queue_name: str, expected_count: int) -> None:
-  attached_key = f'{queue_name}-shared-buffer-attached'
+def wait_for_shuffle_buffer_attach_count(coord: CoordinatorClient, queue_name: str, expected_count: int) -> None:
   last_log_time = 0.
-  while (attached_count := int(cast(bytes | int | None, r.get(attached_key)) or 0)) < expected_count:
+  while (attached_count := coord.attached_count()) < expected_count:
     if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-      logger.info(f"waiting for {attached_key} - {attached_count} / {expected_count}")
+      logger.info(f"waiting for {queue_name} attached processes - {attached_count} / {expected_count}")
       last_log_time = time.perf_counter()
     time.sleep(0.1)
 
@@ -280,83 +260,28 @@ def create_shared_shuffle_buffer_attachment(first_samples: Buffer, shuffle_size:
   return ShuffleBufferAttachment(metadata=metadata, shuffle_buffer=shuffle_buffer, dummy_batch=dummy_batch)
 
 
-def start_shuffle_buffer_attach_server(config: DataloaderConfig, queue_name: str, attachment: ShuffleBufferAttachment) -> threading.Thread:
-  authkey = initialize_shuffle_buffer_tensor_ipc()
-  h = hashlib.sha1(f'gigashuffle:{os.getuid()}:{queue_name}'.encode()).hexdigest()[:24]
-  sock_path = f'/tmp/gigashuffle-{os.getuid()}-{h}.sock'
-  attach_key = f'{queue_name}-shared-buffer-attach-socket'
-  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
-
-  try:
-    os.unlink(sock_path)
-  except FileNotFoundError:
-    pass
-
-  listener = Listener(sock_path, family='AF_UNIX', backlog=128, authkey=authkey)
-  r.set(attach_key, sock_path)
-
-  def serve() -> None:
-    try:
-      while True:
-        conn = listener.accept()
-        try:
-          req = conn.recv()
-          if not isinstance(req, dict) or req.get('op') != 'attach':
-            conn.send(dict(ok=False, error='unknown op'))
-            continue
-          conn.send(dict(ok=True, attachment=attachment))
-        except (EOFError, OSError):
-          pass
-        finally:
-          conn.close()
-    finally:
-      listener.close()
-      try:
-        os.unlink(sock_path)
-      except FileNotFoundError:
-        pass
-
-  t = threading.Thread(target=serve, name=f'gigashuffle-attach-{queue_name}', daemon=True)
-  t.start()
-  return t
+def start_coordinator(queue_name: str, attachment: ShuffleBufferAttachment, empty_indices: list[int]) -> None:
+  CoordinatorServer(queue_name, attachment, empty_indices).start()
 
 
-def attach_to_shared_shuffle_buffer(config: DataloaderConfig, queue_name: str) -> ShuffleBufferAttachment:
-  authkey = initialize_shuffle_buffer_tensor_ipc()
-  attach_key = f'{queue_name}-shared-buffer-attach-socket'
-  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+def attach_to_shared_shuffle_buffer(queue_name: str, count_attach: bool = True, check_children: Any | None = None) -> ShuffleBufferAttachment:
+  initialize_shuffle_buffer_tensor_ipc()
+  coord = CoordinatorClient(queue_name)
   last_log_time = 0.
-  last_error: BaseException | None = None
 
   while True:
-    raw = cast(bytes | str | None, r.get(attach_key))
-    if raw is None:
-      if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-        logger.info(f"waiting for gigashuffle attach server on {attach_key}")
-        last_log_time = time.perf_counter()
-      time.sleep(0.05)
-      continue
-
-    sock_path = raw.decode() if isinstance(raw, bytes) else str(raw)
     try:
-      conn = Client(sock_path, family='AF_UNIX', authkey=authkey)
-      try:
-        conn.send(dict(op='attach', pid=os.getpid()))
-        msg = conn.recv()
-      finally:
-        conn.close()
-      if not isinstance(msg, dict) or not msg.get('ok'):
-        raise RuntimeError(f"failed to attach to gigashuffle buffer: {msg}")
-      return cast(ShuffleBufferAttachment, msg['attachment'])
-    except (AuthenticationError, ConnectionRefusedError, FileNotFoundError, EOFError, OSError) as e:
-      last_error = e
+      return cast(ShuffleBufferAttachment, coord.attach(count_attach=count_attach))
+    except COORDINATOR_CONNECT_ERRORS as e:
+      if check_children is not None:
+        check_children()
       if time.perf_counter() - last_log_time >= LOG_INTERVAL_S:
-        logger.info(f"waiting for gigashuffle attach server on {attach_key}: {last_error}")
+        logger.info(f"waiting for gigashuffle coordinator for {queue_name}: {e}")
         last_log_time = time.perf_counter()
       time.sleep(0.05)
 
 
-def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Any, Buffer, ShuffleBufferMetadata]:
+def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[CoordinatorClient, Any, Buffer, ShuffleBufferMetadata]:
   init_logger()
   initialize_shuffle_buffer_tensor_ipc()
   setproctitle(f'gigashuffle writer {queue_name} local_rank={config.local_rank} proc={proc_idx}')
@@ -371,33 +296,27 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   np.random.seed(global_proc_idx)
   set_worker_info(dset, worker_id=global_proc_idx, num_workers=total_procs, seed=global_proc_idx)
 
-  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
+  coord = CoordinatorClient(queue_name)
   dset_iter = iter(dset) if hasattr(dset, '__iter__') else dset
   if local_proc_idx == 0:
-    initialize_redis_queue(r, queue_name, shuffle_size)
-    r.set(f'{queue_name}-initializing', 1)
     input_samples, input_bs, input_bs_key = fetch_initial_sample(dset_iter, config)
     attachment = create_shared_shuffle_buffer_attachment(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.bs)
     initial_idx_list = list(range(input_bs))
-    r.srem(f'{queue_name}-empty', *initial_idx_list)
-    r.set(f'{queue_name}-shared-buffer-meta', pickle.dumps(attachment.metadata))
-    start_shuffle_buffer_attach_server(config, queue_name, attachment)
+    start_coordinator(queue_name, attachment, list(range(input_bs, shuffle_size)))
     expected_attach_count = config.local_world_size * (config.num_writers + config.num_readers) - 1
-    wait_for_shuffle_buffer_attach_count(r, queue_name, expected_attach_count)
+    wait_for_shuffle_buffer_attach_count(coord, queue_name, expected_attach_count)
     for i in range(len(attachment.shuffle_buffer)):
       for k in attachment.shuffle_buffer[i].keys():
         tmp = torch.as_tensor(input_samples[i][k])
         if tmp.device != attachment.shuffle_buffer[i][k].device or tmp.dtype != attachment.shuffle_buffer[i][k].dtype:
           tmp = tmp.to(device=attachment.shuffle_buffer[i][k].device, dtype=attachment.shuffle_buffer[i][k].dtype)
         attachment.shuffle_buffer[i][k][initial_idx_list] = tmp
-    r.sadd(f'{queue_name}-full', *initial_idx_list)
-    r.delete(f'{queue_name}-initializing')
+    coord.push('full', initial_idx_list)
   else:
-    attachment = attach_to_shared_shuffle_buffer(config, queue_name)
-    r.incr(f'{queue_name}-shared-buffer-attached')
+    attachment = attach_to_shared_shuffle_buffer(queue_name)
 
   logger.info(f"writer {config.global_rank}-{proc_idx} initialized with input_bs {attachment.metadata['input_bs']} output_bs {config.bs}")
-  return r, dset_iter, attachment.shuffle_buffer, attachment.metadata
+  return coord, dset_iter, attachment.shuffle_buffer, attachment.metadata
 
 
 def write_samples_to_buffer(shuffle_buffer: Buffer, samples: Buffer, idx_list: list[int], local_input_bs: int) -> None:
@@ -411,11 +330,10 @@ def write_samples_to_buffer(shuffle_buffer: Buffer, samples: Buffer, idx_list: l
 
 def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
-  r, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
-  empty_key = f'{queue_name}-empty'
+  coord, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
   rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
   while True:
-    training_context = cast(bytes | None, r.get(f'{queue_name}-training-context-{rank_id}'))
+    training_context = coord.get_context(rank_id)
     if training_context is not None:
       dset.context = pickle.loads(training_context)
     samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
@@ -423,14 +341,14 @@ def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
     if local_input_bs > max_input_bs:
       local_input_bs = max_input_bs
       print_small_shuffle_warning()
-    idx_list = fetch_rand_from_queue(r, empty_key, local_input_bs)
+    idx_list = fetch_rand_from_queue(coord, 'empty', local_input_bs)
     write_samples_to_buffer(shuffle_buffer, samples, idx_list, local_input_bs)
-    r.sadd(f'{queue_name}-full', *idx_list)
+    coord.push('full', idx_list)
 
 
-def exit_or_keep_attach_server_alive(owns_attach_server: bool) -> None:
-  if owns_attach_server:
-    # Keep the attach server available for late dummy-batch requests.
+def exit_or_keep_coordinator_alive(owns_coordinator: bool) -> None:
+  if owns_coordinator:
+    # Keep the coordinator available for late dummy-batch requests.
     while True:
       time.sleep(3600)
   raise SystemExit(FILL_ONCE_WRITER_DONE_EXITCODE)
@@ -438,41 +356,38 @@ def exit_or_keep_attach_server_alive(owns_attach_server: bool) -> None:
 
 def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
-  r, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
-  owns_attach_server = config.local_rank * config.num_writers + proc_idx == 0
-  empty_key = f'{queue_name}-empty'
+  coord, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
+  owns_coordinator = config.local_rank * config.num_writers + proc_idx == 0
   rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
   while True:
-    training_context = cast(bytes | None, r.get(f'{queue_name}-training-context-{rank_id}'))
+    training_context = coord.get_context(rank_id)
     if training_context is not None:
       dset.context = pickle.loads(training_context)
-    empty_n = cast(int, r.scard(empty_key))
+    empty_n = coord.count('empty')
     if empty_n == 0:
-      exit_or_keep_attach_server_alive(owns_attach_server)
+      exit_or_keep_coordinator_alive(owns_coordinator)
     samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
     local_input_bs = min(local_input_bs, empty_n)
-    idx_list = [int(x) for x in cast(list[bytes], r.spop(empty_key, local_input_bs))]
+    idx_list = coord.pop('empty', local_input_bs)
     if not idx_list:
-      exit_or_keep_attach_server_alive(owns_attach_server)
+      exit_or_keep_coordinator_alive(owns_coordinator)
     local_input_bs = len(idx_list)
     write_samples_to_buffer(shuffle_buffer, samples, idx_list, local_input_bs)
-    r.sadd(f'{queue_name}-full', *idx_list)
+    coord.push('full', idx_list)
 
 
-def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[StrictRedis, Buffer, Buffer]:
+def initialize_reader(config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[CoordinatorClient, Buffer, Buffer]:
   init_logger()
-  initialize_shuffle_buffer_tensor_ipc()
   setproctitle(f'gigashuffle reader {queue_name} local_rank={config.local_rank} proc={proc_idx}')
-  r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
-  attachment = attach_to_shared_shuffle_buffer(config, queue_name)
-  r.incr(f'{queue_name}-shared-buffer-attached')
+  coord = CoordinatorClient(queue_name)
+  attachment = attach_to_shared_shuffle_buffer(queue_name)
   reader_buffer: Buffer = [{} for _ in range(max(t['i'] for t in attachment.metadata['fields']) + 1)]
   for t in attachment.metadata['fields']:
     dtype = getattr(torch, t['dtype'])
     shape = tuple([config.bs] + list(t['shape'][1:]))
     reader_buffer[t['i']][t['k']] = torch.empty(shape, dtype=dtype).share_memory_()
   reader_buffer[0][INDEX_KEY] = torch.empty(config.bs, dtype=torch.int64).share_memory_()
-  return r, attachment.shuffle_buffer, reader_buffer
+  return coord, attachment.shuffle_buffer, reader_buffer
 
 
 def copy_to_reader_buffer(reader_buffer: Buffer, shuffle_buffer: Buffer, idx_list: list[int]) -> None:
@@ -492,37 +407,36 @@ def send_reader_buffer(ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event,
 def streaming_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
   assert request_batch_q is None
   set_parent_death_signal(parent_pid)
-  r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
+  coord, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
   min_mixing_n = int(config.min_mixing * config.shuffle_size)
-  return_key = f'{queue_name}-empty' if config.evict_on_read else f'{queue_name}-full'
+  return_queue = 'empty' if config.evict_on_read else 'full'
 
   for batch_idx in count():
-    idx_list = fetch_rand_from_queue(r, f'{queue_name}-full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
+    idx_list = fetch_rand_from_queue(coord, 'full', config.bs, min_mixing_n=min_mixing_n, log_progress=batch_idx == 0 and config.local_rank == 0 and proc_idx == 0)
     copy_to_reader_buffer(reader_buffer, shuffle_buffer, idx_list)
-    r.sadd(return_key, *idx_list)
+    coord.push(return_queue, idx_list)
     send_reader_buffer(ready_q, ready_e, reader_buffer, proc_idx)
 
 
 def fill_once_reader(config: DataloaderConfig, ready_q: SimpleQueue[tuple[Buffer, int]], ready_e: Event, request_batch_q: SimpleQueue[int] | None, proc_idx: int, queue_name: str, parent_pid: int):
   assert request_batch_q is not None
   set_parent_death_signal(parent_pid)
-  r, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
+  coord, shuffle_buffer, reader_buffer = initialize_reader(config, proc_idx, queue_name)
 
   last_log_time = 0.
-  full_key = f'{queue_name}-full'
   wait_start_time = time.perf_counter()
-  scard = cast(int, r.scard(full_key))
+  scard = coord.count('full')
   wait_start_scard = scard
   while scard < config.shuffle_size:
     now = time.perf_counter()
     if config.local_rank == 0 and now - last_log_time >= LOG_INTERVAL_S:
       elapsed_s, eta_s = get_elapsed_and_eta(now, wait_start_time, scard, wait_start_scard, config.shuffle_size)
-      logger.info(f"waiting for {full_key} - {scard} / {config.shuffle_size} ({elapsed_s:.0f}s/{eta_s:.0f}s)")
+      logger.info(f"waiting for {queue_name}-full - {scard} / {config.shuffle_size} ({elapsed_s:.0f}s/{eta_s:.0f}s)")
       last_log_time = now
     time.sleep(0.1)
-    scard = cast(int, r.scard(full_key))
+    scard = coord.count('full')
   if config.local_rank == 0:
-    logger.info(f"{full_key} reached {config.shuffle_size}")
+    logger.info(f"{queue_name}-full reached {config.shuffle_size}")
 
   while True:
     batch_idx = request_batch_q.get()
@@ -550,13 +464,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self._dummy_batch: Buffer | None = None
     self._rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
     self._shutdown = False
-
-    self._r = make_redis_client(host=config.redis_host, port=config.redis_port, db=config.redis_db)
-    try:
-      assert self._r.ping()
-    except Exception as e:
-      raise AssertionError(f"Redis is not reachable at {config.redis_host}:{config.redis_port}/{config.redis_db}") from e
-    self._r.delete(f'{self.queue_name}-training-context-{self._rank_id}')
+    self._coord = CoordinatorClient(self.queue_name)
 
     ctx = mp.get_context('spawn')
     self.ready_q: SimpleQueue[tuple[Buffer, int]] = ctx.SimpleQueue()
@@ -577,8 +485,17 @@ class MultiprocessShuffledDataloader(IterableDataset):
     for i, p in enumerate(self.children):
       p.start()
 
+  def _coord_call(self, fn, *args):
+    while True:
+      try:
+        return fn(*args)
+      except COORDINATOR_CONNECT_ERRORS:
+        if time.perf_counter() - self.check_child_time > 1.0:
+          self.check_children()
+        time.sleep(0.05)
+
   def attach_training_context(self, context: Any) -> None:
-    self._r.set(f'{self.queue_name}-training-context-{self._rank_id}', pickle.dumps(context))
+    self._coord_call(self._coord.set_context, self._rank_id, pickle.dumps(context))
 
   def state_dict(self) -> dict[str, Any]:
     state = {}
@@ -599,35 +516,19 @@ class MultiprocessShuffledDataloader(IterableDataset):
 
   def get_dummy_batch(self) -> Buffer:
     if self._dummy_batch is None:
-      while self._r.get(f'{self.queue_name}-shared-buffer-meta') is None:
-        if time.perf_counter() - self.check_child_time > 1.0:
-          self.check_children()
-        time.sleep(0.1)
-      attachment = attach_to_shared_shuffle_buffer(self.config, self.queue_name)
+      attachment = attach_to_shared_shuffle_buffer(self.queue_name, count_attach=False, check_children=self.check_children)
       self._dummy_batch = attachment.dummy_batch
     return self._dummy_batch
 
   def stats(self) -> ShuffleBufferStats:
-    with self._r.pipeline(transaction=True) as pipe:
-      full, empty = cast(
-        list[int],
-        pipe.scard(f'{self.queue_name}-full').scard(f'{self.queue_name}-empty').execute(),
-      )
-    in_flight = self.config.shuffle_size - full - empty
-    return ShuffleBufferStats(full=full, empty=empty, in_flight=in_flight)
+    stats = self._coord_call(self._coord.stats)
+    return ShuffleBufferStats(full=stats['full'], empty=stats['empty'], in_flight=stats['in_flight'])
 
   def evict(self, indices: list[int]) -> int:
     assert not self.config.evict_on_read, "evict() requires evict_on_read=False"
     if not (indices := [int(i) for i in indices]):
       return 0
-    full_key, empty_key = f'{self.queue_name}-full', f'{self.queue_name}-empty'
-    with self._r.pipeline(transaction=False) as pipe:
-      for idx in indices:
-        pipe.srem(full_key, idx)
-      removed = pipe.execute()
-    if freed := [idx for idx, ok in zip(indices, removed) if ok]:
-      self._r.sadd(empty_key, *freed)
-    return len(freed)
+    return self._coord_call(self._coord.evict, indices)
 
   def check_children(self) -> None:
     for i, p in enumerate(self.children):

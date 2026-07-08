@@ -5,12 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gigashuffle"
 version = "0.1.0"
-description = "Shuffle-buffer dataloaders for PyTorch using Redis coordination and named shared memory"
+description = "Shuffle-buffer dataloaders for PyTorch using local Unix socket coordination and shared memory"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "numpy",
-  "redis",
   "setproctitle",
   "torch",
 ]

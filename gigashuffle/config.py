@@ -15,7 +15,4 @@ class DataloaderConfig:
   global_rank: int = 0
   local_world_size: int = 1
   global_world_size: int = 1
-  redis_host: str = 'localhost'
-  redis_port: int = 6379
-  redis_db: int = 6
   queue_name: str = ''

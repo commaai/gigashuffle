@@ -31,9 +31,6 @@ def main() -> None:
       global_rank=int(os.environ['RANK']),
       local_world_size=int(os.environ.get('LOCAL_WORLD_SIZE', '1')),
       global_world_size=int(os.environ['WORLD_SIZE']),
-      redis_host=os.environ.get('REDIS_HOST', 'localhost'),
-      redis_port=int(os.environ.get('REDIS_PORT', '6379')),
-      redis_db=int(os.environ.get('REDIS_DB', '6')),
       queue_name=queue_name,
     ),
   )
