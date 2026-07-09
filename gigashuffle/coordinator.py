@@ -1,12 +1,18 @@
 import hashlib
+import logging
 import os
 import random
+import time
 from multiprocessing.connection import AuthenticationError, Client, Listener
 from threading import Thread
 from typing import Any
 
 
 COORDINATOR_CONNECT_ERRORS = (AuthenticationError, EOFError, OSError)
+COORDINATOR_ACCEPT_ERRORS = (AuthenticationError, EOFError, BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+COORDINATOR_REQUEST_RETRIES = 10
+COORDINATOR_REQUEST_RETRY_SLEEP_S = 0.1
+logger = logging.getLogger(__name__)
 
 
 def coordinator_authkey() -> bytes:
@@ -91,7 +97,10 @@ class CoordinatorServer:
   def serve(self, listener: Listener) -> None:
     try:
       while True:
-        conn = listener.accept()
+        try:
+          conn = listener.accept()
+        except COORDINATOR_ACCEPT_ERRORS:
+          continue
         try:
           try:
             result = self.handle(conn.recv())
@@ -111,17 +120,30 @@ class CoordinatorServer:
 
 
 class CoordinatorClient:
-  def __init__(self, queue_name: str) -> None:
+  def __init__(self, queue_name: str, retries: int = COORDINATOR_REQUEST_RETRIES) -> None:
     self.sock_path = coordinator_socket_path(queue_name)
+    self.retries = retries
 
   @classmethod
-  def from_socket_path(cls, sock_path: str) -> 'CoordinatorClient':
+  def from_socket_path(cls, sock_path: str, retries: int = COORDINATOR_REQUEST_RETRIES) -> 'CoordinatorClient':
     client = cls.__new__(cls)
     client.sock_path = sock_path
+    client.retries = retries
     return client
 
+  def connect(self):
+    for attempt in range(self.retries + 1):
+      try:
+        return Client(self.sock_path, family='AF_UNIX', authkey=coordinator_authkey())
+      except COORDINATOR_CONNECT_ERRORS as e:
+        if attempt >= self.retries:
+          raise
+        logger.warning(f"retrying gigashuffle coordinator connection to {self.sock_path} after {type(e).__name__}: {e}")
+        time.sleep(COORDINATOR_REQUEST_RETRY_SLEEP_S)
+    raise RuntimeError("failed to connect to gigashuffle coordinator")
+
   def request(self, op: str, **kwargs) -> Any:
-    conn = Client(self.sock_path, family='AF_UNIX', authkey=coordinator_authkey())
+    conn = self.connect()
     try:
       conn.send(dict(op=op, **kwargs))
       msg = conn.recv()

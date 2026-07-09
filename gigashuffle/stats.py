@@ -17,7 +17,7 @@ def live_stats(stats_dir: str = DEFAULT_STATS_DIR) -> list[dict[str, int | str]]
   socket_paths = sorted(glob(os.path.join(stats_dir, f'gigashuffle-{os.getuid()}-*.sock')))
   for sock_path in socket_paths:
     try:
-      info = CoordinatorClient.from_socket_path(sock_path).info()
+      info = CoordinatorClient.from_socket_path(sock_path, retries=0).info()
     except STATS_ERRORS:
       continue
     if info['queue_name'] in seen_queues:
