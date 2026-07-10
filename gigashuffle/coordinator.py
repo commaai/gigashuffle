@@ -25,14 +25,29 @@ def coordinator_socket_path(queue_name: str) -> str:
 
 
 class CoordinatorServer:
-  def __init__(self, queue_name: str, attachment: Any, empty_indices: list[int]) -> None:
+  def __init__(self, queue_name: str, attachment: Any | None, empty_indices: list[int], shuffle_size: int | None = None) -> None:
     self.queue_name = queue_name
     self.attachment = attachment
+    if shuffle_size is None:
+      shuffle_size = attachment.metadata['shuffle_size'] if attachment is not None else 0
+    self.shuffle_size = int(shuffle_size)
     self.empty = set(empty_indices)
     self.full: set[int] = set()
     self.attached = 0
     self.training_contexts: dict[str, bytes] = {}
     self.sock_path = coordinator_socket_path(queue_name)
+
+  def publish_ready(self, attachment: Any, empty_indices: list[int]) -> None:
+    shuffle_size = int(attachment.metadata['shuffle_size'])
+    if self.attachment is not None:
+      raise RuntimeError('coordinator is already ready')
+    if self.shuffle_size and shuffle_size != self.shuffle_size:
+      raise RuntimeError(f'coordinator shuffle size changed from {self.shuffle_size} to {shuffle_size}')
+    self.shuffle_size = shuffle_size
+    self.empty = set(map(int, empty_indices))
+    self.full.clear()
+    # Publish the attachment last so the serving thread cannot expose partial state.
+    self.attachment = attachment
 
   def start(self) -> Thread:
     try:
@@ -45,6 +60,7 @@ class CoordinatorServer:
     return t
 
   def pop(self, which: str, count: int) -> list[int]:
+    self.require_ready()
     q = self.full if which == 'full' else self.empty
     n = min(count, len(q))
     if n == 0:
@@ -54,19 +70,28 @@ class CoordinatorServer:
     return idxs
 
   def push(self, which: str, idxs: list[int]) -> int:
+    self.require_ready()
     q = self.full if which == 'full' else self.empty
     before = len(q)
     q.update(map(int, idxs))
     return len(q) - before
 
-  def stats(self) -> dict[str, int]:
+  def stats(self) -> dict[str, int] | None:
+    if self.attachment is None:
+      return None
     full = len(self.full)
     empty = len(self.empty)
-    return dict(full=full, empty=empty, in_flight=self.attachment.metadata['shuffle_size'] - full - empty)
+    return dict(full=full, empty=empty, in_flight=self.shuffle_size - full - empty)
+
+  def require_ready(self) -> None:
+    if self.attachment is None:
+      raise RuntimeError('coordinator is initializing')
 
   def handle(self, req: dict[str, Any]) -> Any:
     op = req.get('op')
     if op == 'attach':
+      if self.attachment is None:
+        return None
       if req.get('count_attach', True):
         self.attached += 1
       return self.attachment
@@ -77,12 +102,16 @@ class CoordinatorServer:
     if op == 'push':
       return self.push(req['which'], list(req['idxs']))
     if op == 'count':
+      self.require_ready()
       return len(self.full if req['which'] == 'full' else self.empty)
     if op == 'stats':
       return self.stats()
     if op == 'info':
-      return dict(queue_name=self.queue_name, attached=self.attached, **self.stats())
+      ready = self.attachment is not None
+      stats = self.stats() if ready else dict(full=0, empty=0, in_flight=self.shuffle_size)
+      return dict(queue_name=self.queue_name, attached=self.attached, ready=ready, **stats)
     if op == 'evict':
+      self.require_ready()
       freed = set(map(int, req['idxs'])) & self.full
       self.full.difference_update(freed)
       self.empty.update(freed)
@@ -153,7 +182,7 @@ class CoordinatorClient:
       raise RuntimeError(f"gigashuffle coordinator request {op!r} failed: {msg}")
     return msg['result']
 
-  def attach(self, count_attach: bool = True) -> Any:
+  def attach(self, count_attach: bool = True) -> Any | None:
     return self.request('attach', count_attach=count_attach)
 
   def attached_count(self) -> int:
@@ -170,10 +199,10 @@ class CoordinatorClient:
   def count(self, which: str) -> int:
     return int(self.request('count', which=which))
 
-  def stats(self) -> dict[str, int]:
+  def stats(self) -> dict[str, int] | None:
     return self.request('stats')
 
-  def info(self) -> dict[str, int | str]:
+  def info(self) -> dict[str, int | str | bool]:
     return self.request('info')
 
   def evict(self, idxs: list[int]) -> int:

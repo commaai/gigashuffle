@@ -267,25 +267,33 @@ def create_shared_shuffle_buffer_attachment(first_samples: Buffer, shuffle_size:
   return ShuffleBufferAttachment(metadata=metadata, shuffle_buffer=shuffle_buffer, dummy_batch=dummy_batch)
 
 
-def start_coordinator(queue_name: str, attachment: ShuffleBufferAttachment, empty_indices: list[int]) -> None:
-  CoordinatorServer(queue_name, attachment, empty_indices).start()
+def start_coordinator(queue_name: str, shuffle_size: int) -> CoordinatorServer:
+  server = CoordinatorServer(queue_name, None, [], shuffle_size)
+  server.start()
+  return server
 
 
 def attach_to_shared_shuffle_buffer(queue_name: str, count_attach: bool = True, check_children: Any | None = None) -> ShuffleBufferAttachment:
   initialize_shuffle_buffer_tensor_ipc()
-  coord = CoordinatorClient(queue_name)
+  coord = CoordinatorClient(queue_name, retries=0)
   last_log_time = time.perf_counter()
+  wait_s = 0.05
 
   while True:
     try:
-      return cast(ShuffleBufferAttachment, coord.attach(count_attach=count_attach))
+      attachment = coord.attach(count_attach=count_attach)
+      if attachment is not None:
+        return cast(ShuffleBufferAttachment, attachment)
+      wait_message = f"waiting for gigashuffle coordinator attachment for {queue_name} to become ready"
     except COORDINATOR_CONNECT_ERRORS as e:
-      if check_children is not None:
-        check_children()
-      if time.perf_counter() - last_log_time >= COORDINATOR_WAIT_LOG_INTERVAL_S:
-        logger.info(f"waiting for gigashuffle coordinator for {queue_name}: {e}")
-        last_log_time = time.perf_counter()
-      time.sleep(0.05)
+      wait_message = f"waiting for gigashuffle coordinator for {queue_name}: {e}"
+    if check_children is not None:
+      check_children()
+    if time.perf_counter() - last_log_time >= COORDINATOR_WAIT_LOG_INTERVAL_S:
+      logger.info(wait_message)
+      last_log_time = time.perf_counter()
+    time.sleep(wait_s)
+    wait_s = min(1.0, wait_s * 2)
 
 
 def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str) -> tuple[CoordinatorClient, Any, Buffer, ShuffleBufferMetadata]:
@@ -304,12 +312,13 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   set_worker_info(dset, worker_id=global_proc_idx, num_workers=total_procs, seed=global_proc_idx)
 
   coord = CoordinatorClient(queue_name)
+  coordinator_server = start_coordinator(queue_name, shuffle_size) if local_proc_idx == 0 else None
   dset_iter = iter(dset) if hasattr(dset, '__iter__') else dset
-  if local_proc_idx == 0:
+  if coordinator_server is not None:
     input_samples, input_bs, input_bs_key = fetch_initial_sample(dset_iter, config)
     attachment = create_shared_shuffle_buffer_attachment(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.bs)
     initial_idx_list = list(range(input_bs))
-    start_coordinator(queue_name, attachment, list(range(input_bs, shuffle_size)))
+    coordinator_server.publish_ready(attachment, list(range(input_bs, shuffle_size)))
     expected_attach_count = config.local_world_size * (config.num_writers + config.num_readers) - 1
     wait_for_shuffle_buffer_attach_count(coord, queue_name, expected_attach_count)
     for i in range(len(attachment.shuffle_buffer)):
@@ -471,7 +480,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     self._dummy_batch: Buffer | None = None
     self._rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
     self._shutdown = False
-    self._coord = CoordinatorClient(self.queue_name)
+    self._coord = CoordinatorClient(self.queue_name, retries=0)
 
     ctx = mp.get_context('spawn')
     self.ready_q: SimpleQueue[tuple[Buffer, int]] = ctx.SimpleQueue()
@@ -528,8 +537,14 @@ class MultiprocessShuffledDataloader(IterableDataset):
     return self._dummy_batch
 
   def stats(self) -> ShuffleBufferStats:
-    stats = self._coord_call(self._coord.stats)
-    return ShuffleBufferStats(full=stats['full'], empty=stats['empty'], in_flight=stats['in_flight'])
+    wait_s = 0.05
+    while True:
+      stats = self._coord_call(self._coord.stats)
+      if stats is not None:
+        return ShuffleBufferStats(full=stats['full'], empty=stats['empty'], in_flight=stats['in_flight'])
+      self.check_children()
+      time.sleep(wait_s)
+      wait_s = min(1.0, wait_s * 2)
 
   def evict(self, indices: list[int]) -> int:
     assert not self.config.evict_on_read, "evict() requires evict_on_read=False"
