@@ -129,6 +129,15 @@ def test_torchrun_gloo():
   assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_torchrun_gloo_per_rank_writers():
+  # rank 0 spawns 1 writer, rank 1 spawns 0 writers; they share one buffer via the coordinator.
+  env = os.environ.copy()
+  env['GIGASHUFFLE_QUEUE'] = f'torchrun-per-rank-{uuid.uuid4().hex}'
+  cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nnodes=1', '--nproc-per-node=2', str(Path(__file__).with_name('torchrun_gloo_per_rank.py'))]
+  result = subprocess.run(cmd, env=env, text=True, capture_output=True, timeout=90)
+  assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_dummy_batch_returns_before_min_mixing():
   queue_name = f'dummy-{uuid.uuid4().hex}'
   loader = MultiprocessShuffledDataloader(ToyDataset(sleep=1.0), config(queue_name, shuffle_size=64, min_mixing=0.5))
