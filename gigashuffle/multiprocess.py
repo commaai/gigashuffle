@@ -303,13 +303,13 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   os.system(f'renice -n 3 -p {os.getpid()} > /dev/null')
 
   shuffle_size = config.shuffle_size
-  global_proc_idx = config.global_rank * config.num_writers + proc_idx
-  total_procs = config.global_world_size * config.num_writers
-  local_proc_idx = config.local_rank * config.num_writers + proc_idx
+  total_writers = config.resolved_total_writers()
+  global_proc_idx = config.resolved_global_writer_offset() + proc_idx
+  local_proc_idx = config.resolved_local_writer_offset() + proc_idx
   random.seed(global_proc_idx)
   torch.manual_seed(global_proc_idx)
   np.random.seed(global_proc_idx)
-  set_worker_info(dset, worker_id=global_proc_idx, num_workers=total_procs, seed=global_proc_idx)
+  set_worker_info(dset, worker_id=global_proc_idx, num_workers=total_writers, seed=global_proc_idx)
 
   coord = CoordinatorClient(queue_name)
   coordinator_server = start_coordinator(queue_name, shuffle_size) if local_proc_idx == 0 else None
@@ -319,7 +319,7 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
     attachment = create_shared_shuffle_buffer_attachment(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.bs)
     initial_idx_list = list(range(input_bs))
     coordinator_server.publish_ready(attachment, list(range(input_bs, shuffle_size)))
-    expected_attach_count = config.local_world_size * (config.num_writers + config.num_readers) - 1
+    expected_attach_count = total_writers + config.local_world_size * config.num_readers - 1
     wait_for_shuffle_buffer_attach_count(coord, queue_name, expected_attach_count)
     for i in range(len(attachment.shuffle_buffer)):
       for k in attachment.shuffle_buffer[i].keys():
@@ -353,7 +353,7 @@ def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
     if training_context is not None:
       dset.context = pickle.loads(training_context)
     samples, local_input_bs, _ = get_samples(dset_iter, metadata['input_bs_key'], max_retries=config.writer_max_retries)
-    max_input_bs = (config.shuffle_size - config.bs) // (config.local_world_size * config.num_writers)
+    max_input_bs = (config.shuffle_size - config.bs) // config.resolved_total_writers()
     if local_input_bs > max_input_bs:
       local_input_bs = max_input_bs
       print_small_shuffle_warning()
@@ -373,7 +373,7 @@ def exit_or_keep_coordinator_alive(owns_coordinator: bool) -> None:
 def fill_once_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, queue_name: str, parent_pid: int) -> None:
   set_parent_death_signal(parent_pid)
   coord, dset_iter, shuffle_buffer, metadata = initialize_writer(dset, config, proc_idx, queue_name)
-  owns_coordinator = config.local_rank * config.num_writers + proc_idx == 0
+  owns_coordinator = config.resolved_local_writer_offset() + proc_idx == 0
   rank_id = RANK_ID_FORMAT.format(global_rank=config.global_rank)
   while True:
     training_context = coord.get_context(rank_id)
@@ -467,7 +467,8 @@ class MultiprocessShuffledDataloader(IterableDataset):
     init_logger()
     self.dset = dset
     self.config = config
-    assert config.num_writers > 0, "gigashuffle requires num_writers > 0"
+    assert config.resolved_total_writers() > 0, "gigashuffle requires at least one writer across all ranks"
+    assert config.num_writers >= 0, "gigashuffle requires num_writers >= 0"
     assert config.queue_name, "MultiprocessShuffledDataloader requires config.queue_name"
     assert not (config.fill_once and not config.evict_on_read), "evict_on_read=False is not supported with fill_once"
     if config.fill_once:
