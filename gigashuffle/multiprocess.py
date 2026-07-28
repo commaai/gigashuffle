@@ -1,11 +1,13 @@
 import atexit
 import ctypes
 import logging
+import math
 import os
 import pickle
 import random
 import signal
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from itertools import count
@@ -33,6 +35,7 @@ EMPTY_SAMPLE_BACKOFF_WINDOW_S = 10.0
 PR_SET_PDEATHSIG = 1
 FILL_ONCE_WRITER_DONE_EXITCODE = 81
 CLOSE_JOIN_TIMEOUT_S = 0.2
+SHARED_MEMORY_DIR = '/dev/shm'
 ShuffleBufferMetadata = dict[str, Any]
 logger = logging.getLogger(__name__)
 already_warned = False
@@ -232,6 +235,17 @@ def wait_for_shuffle_buffer_attach_count(coord: CoordinatorClient, queue_name: s
     time.sleep(0.1)
 
 
+def empty_shared_tensor(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+  tensor = torch.empty(0, dtype=dtype)
+  nbytes = math.prod(shape) * tensor.element_size()
+  # Import a sparse anonymous file into PyTorch so allocation stays independent
+  # of tensor size while the standard multiprocessing reducer can still pass its FD.
+  with tempfile.TemporaryFile(prefix='gigashuffle-', dir=SHARED_MEMORY_DIR) as shm:
+    os.ftruncate(shm.fileno(), nbytes)
+    storage = torch.UntypedStorage._new_shared_fd_cpu(shm.fileno(), nbytes)
+  return tensor.set_(storage, 0, shape)
+
+
 def create_shared_shuffle_buffer_attachment(first_samples: Buffer, shuffle_size: int, input_bs: int, input_bs_key: tuple[int, str], queue_name: str, dummy_bs: int, print_shapes: bool = True) -> ShuffleBufferAttachment:
   metadata: ShuffleBufferMetadata = dict(queue_name=queue_name, shuffle_size=shuffle_size, input_bs=input_bs, input_bs_key=input_bs_key, fields=[])
   shuffle_buffer = []
@@ -241,9 +255,10 @@ def create_shared_shuffle_buffer_attachment(first_samples: Buffer, shuffle_size:
     for k,v in first_samples[i].items():
       dtype = numpy_type_to_torch(v.dtype)
       shape = tuple([shuffle_size]+list(v.shape[1:]))
-      tensor = torch.empty(shape, dtype=dtype).share_memory_()
+      start_time = time.perf_counter()
+      tensor = empty_shared_tensor(shape, dtype)
       if print_shapes:
-        logger.info(f"allocating shared shape {list(shape)} for {k} with type {dtype}")
+        logger.info(f"allocated shared shape {list(shape)} for {k} with type {dtype} in {time.perf_counter() - start_time:.3f}s")
       b[k] = tensor
       metadata['fields'].append(dict(i=i, k=k, shape=shape, dtype=str(dtype).removeprefix('torch.'), storage_offset=tensor.storage_offset(), stride=tensor.stride()))
     shuffle_buffer.append(b)
