@@ -332,16 +332,12 @@ def initialize_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, qu
   if coordinator_server is not None:
     input_samples, input_bs, input_bs_key = fetch_initial_sample(dset_iter, config)
     attachment = create_shared_shuffle_buffer_attachment(input_samples, shuffle_size, input_bs, input_bs_key, queue_name, config.bs)
-    initial_idx_list = list(range(input_bs))
-    coordinator_server.publish_ready(attachment, list(range(input_bs, shuffle_size)))
+    initial_input_bs = min(input_bs, shuffle_size)
+    initial_idx_list = list(range(initial_input_bs))
+    coordinator_server.publish_ready(attachment, list(range(initial_input_bs, shuffle_size)))
     expected_attach_count = config.local_world_size * (config.num_writers + config.num_readers) - 1
     wait_for_shuffle_buffer_attach_count(coord, queue_name, expected_attach_count)
-    for i in range(len(attachment.shuffle_buffer)):
-      for k in attachment.shuffle_buffer[i].keys():
-        tmp = torch.as_tensor(input_samples[i][k])
-        if tmp.device != attachment.shuffle_buffer[i][k].device or tmp.dtype != attachment.shuffle_buffer[i][k].dtype:
-          tmp = tmp.to(device=attachment.shuffle_buffer[i][k].device, dtype=attachment.shuffle_buffer[i][k].dtype)
-        attachment.shuffle_buffer[i][k][initial_idx_list] = tmp
+    write_samples_to_buffer(attachment.shuffle_buffer, input_samples, initial_idx_list, initial_input_bs)
     coord.push('full', initial_idx_list)
   else:
     attachment = attach_to_shared_shuffle_buffer(queue_name)
