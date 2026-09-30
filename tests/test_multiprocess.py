@@ -287,11 +287,11 @@ def test_fill_once_loops_in_order():
   loader = MultiprocessShuffledDataloader(OrderedDataset(), config(queue_name, shuffle_size=12, min_mixing=1, fill_once=True, num_readers=1, num_writers=1))
   try:
     assert loader.get_dummy_batch()[0]['x'].tolist() == [0, 1, 2, 3]
+    it = iter(loader)
     deadline = time.perf_counter() + 5
     while time.perf_counter() < deadline and loader.stats().full < 12:
       time.sleep(0.05)
     assert loader.stats().full == 12
-    it = iter(loader)
     batches = [next(it)[0]['x'].tolist() for _ in range(3)]
     assert batches[0] == [0, 1, 2, 3]
     assert sorted(x for batch in batches for x in batch) == list(range(12))
@@ -396,6 +396,7 @@ def test_check_children_health():
   queue_name = f'health-{uuid.uuid4().hex}'
   loader = MultiprocessShuffledDataloader(ToyDataset(), config(queue_name))
   try:
+    iter(loader)
     loader.children[0].terminate()
     loader.children[0].join(timeout=5)
     with pytest.raises(RuntimeError, match='child'):
