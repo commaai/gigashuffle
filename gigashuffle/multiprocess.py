@@ -513,10 +513,11 @@ class MultiprocessShuffledDataloader(IterableDataset):
       args = (config, self.ready_q, self.ready_e[i], self.request_batch_q, i, self.queue_name, parent_pid)
       self.children.append(ctx.Process(target=reader_fn, args=args, daemon=True))
     for i in range(self.config.num_writers):
-      self.children.append(ctx.Process(target=writer_fn, args=(dset, config, i, self.queue_name, parent_pid), daemon=True))
-
-    for i, p in enumerate(self.children):
-      p.start()
+      writer_process = ctx.Process(target=writer_fn, args=(dset, config, i, self.queue_name, parent_pid), daemon=True)
+      self.children.append(writer_process)
+      # start writer 0 to publish dummy batch before starting all workers
+      if i == 0:
+        writer_process.start()
 
   def _coord_call(self, fn, *args):
     while True:
@@ -571,6 +572,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
 
   def check_children(self) -> None:
     for i, p in enumerate(self.children):
+      if p.pid is None: continue
       if not p.is_alive():
         if self.config.fill_once and i >= self.config.num_readers and p.exitcode == FILL_ONCE_WRITER_DONE_EXITCODE:
           continue
@@ -583,7 +585,7 @@ class MultiprocessShuffledDataloader(IterableDataset):
     if self._shutdown:
       return
     self._shutdown = True
-    children = getattr(self, 'children', [])
+    children = [p for p in getattr(self, 'children', []) if p.pid is not None]
     try:
       for p in children:
         if p.is_alive():
@@ -610,6 +612,11 @@ class MultiprocessShuffledDataloader(IterableDataset):
       pass
 
   def __iter__(self) -> Iterator[Buffer]:
+    for p in self.children:
+      if p.pid is None: p.start()
+    return self._iter_batches()
+
+  def _iter_batches(self) -> Iterator[Buffer]:
     yielded = 0
     if self.config.fill_once:
       max_iters = cast(int, self.max_iters)
