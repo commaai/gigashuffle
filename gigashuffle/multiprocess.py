@@ -614,7 +614,9 @@ class MultiprocessShuffledDataloader(IterableDataset):
   def __iter__(self) -> Iterator[Buffer]:
     for p in self.children:
       if p.pid is None: p.start()
+    return self._iter_batches()
 
+  def _iter_batches(self) -> Iterator[Buffer]:
     yielded = 0
     if self.config.fill_once:
       max_iters = cast(int, self.max_iters)
