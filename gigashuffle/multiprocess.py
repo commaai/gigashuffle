@@ -185,9 +185,14 @@ def get_memory_size(first_samples, input_bs):
   return memory_size // input_bs
 
 
+def check_writer_headroom(config: DataloaderConfig, input_bs: int) -> None:
+  writer_slots = max(2, config.local_world_size * config.num_writers) * input_bs
+  if not config.fill_once and int(config.min_mixing * config.shuffle_size) >= config.shuffle_size - writer_slots:
+    raise RuntimeError(f"Shuffle buffer too small for {writer_slots} writer slots and min_mixing={config.min_mixing}")
+
+
 def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, int, tuple[int, str]]:
   shuffle_size = config.shuffle_size
-  min_mixing_n = int(config.min_mixing * shuffle_size)
   input_samples, input_bs, input_bs_key = get_samples(dset, max_retries=config.writer_max_retries)
   memory_size = get_memory_size(input_samples, input_bs)
 
@@ -195,8 +200,7 @@ def fetch_initial_sample(dset: Any, config: DataloaderConfig) -> tuple[Buffer, i
   if shuffle_size < config.bs * config.local_world_size:
     N = config.local_world_size * config.num_readers
     raise RuntimeError(f"Shuffle buffer must be large enough to accommodate at least N batches, but buffer size = {shuffle_size}, batch size = {config.bs}, N = {N}")
-  if not config.fill_once and min_mixing_n >= shuffle_size - 2*input_bs:
-    raise RuntimeError(f"To avoid deadlock, min_mixing_n ({min_mixing_n}) must be less than {shuffle_size - 2*input_bs}")
+  check_writer_headroom(config, input_bs)
 
   return input_samples, input_bs, input_bs_key
 
@@ -368,6 +372,7 @@ def streaming_writer(dset: Dataset, config: DataloaderConfig, proc_idx: int, que
     if local_input_bs > max_input_bs:
       local_input_bs = max_input_bs
       print_small_shuffle_warning()
+    check_writer_headroom(config, local_input_bs)
     idx_list = fetch_rand_from_queue(coord, 'empty', local_input_bs)
     write_samples_to_buffer(shuffle_buffer, samples, idx_list, local_input_bs)
     coord.push('full', idx_list)
